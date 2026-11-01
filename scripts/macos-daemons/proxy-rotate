@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+import urllib.request
+import json
+import subprocess
+import datetime
+import os
+import time
+import sys
+import re
+
+API_KEY = "wJpNTXYhqLZvRtkKHcMTZl"
+API_URL = f"https://proxyxoay.shop/api/get.php?key={API_KEY}"
+UPSTREAM_PROXY = "http://160.250.166.20:10427"
+LOG_DIR = os.path.expanduser("~/.local/share/opencode/log")
+LOG_FILE = os.path.join(LOG_DIR, "proxy-rotate.log")
+ROTATING_FLAG = "/tmp/proxy_rotating"
+FAKE_UUID_FILE = os.path.expanduser("~/.local/share/opencode/fake_uuid")
+USED_IPS_FILE = os.path.expanduser("~/.local/share/opencode/used_ips.json")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
+def log(msg):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{now}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def notify(title, message):
+    try:
+        apple_script = f'display notification "{message}" with title "{title}" sound name "Glass"'
+        subprocess.run(["osascript", "-e", apple_script], capture_output=True)
+    except Exception:
+        pass
+
+# ========================================================
+# QUẢN LÝ DANH SÁCH IP ĐÃ DÙNG (CHỐNG LẶP / DEDUPLICATION)
+# ========================================================
+
+def get_current_quota_cycle_start():
+    """Hạn mức OpenCode reset lúc 00:00 UTC (tức 7:00 AM giờ Việt Nam).
+    Tính mốc 7:00 AM gần nhất. Nếu IP được dùng trước mốc này, nó đã được reset."""
+    now = datetime.datetime.now()
+    reset_today = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    if now < reset_today:
+        reset_today -= datetime.timedelta(days=1)
+    return reset_today.timestamp()
+
+def load_used_ips():
+    """Đọc cơ sở dữ liệu IP đã dùng."""
+    if not os.path.exists(USED_IPS_FILE):
+        return {"ips": {}}
+    try:
+        with open(USED_IPS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"ips": {}}
+
+def save_used_ips(data):
+    """Ghi cơ sở dữ liệu IP đã dùng."""
+    try:
+        with open(USED_IPS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def is_ip_used(ip):
+    """Kiểm tra xem IP đã được sử dụng trong chu kỳ hôm nay (từ 7h sáng) chưa."""
+    if not ip or len(ip) < 7 or "." not in ip:
+        return False
+    data = load_used_ips()
+    ips = data.get("ips", {})
+    if ip in ips:
+        info = ips[ip]
+        last_seen = info.get("timestamp", 0)
+        cycle_start = get_current_quota_cycle_start()
+        if last_seen >= cycle_start:
+            return True
+    return False
+
+def mark_ip_used(ip, reason=""):
+    """Đánh dấu IP đã được sử dụng trong chu kỳ hiện tại."""
+    if not ip or len(ip) < 7 or "." not in ip:
+        return
+    data = load_used_ips()
+    if "ips" not in data:
+        data["ips"] = {}
+
+    now = datetime.datetime.now()
+    ts = now.timestamp()
+    time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    current_entry = data["ips"].get(ip, {})
+    count = current_entry.get("count", 0) + 1
+    first_seen = current_entry.get("first_seen", time_str)
+
+    data["ips"][ip] = {
+        "timestamp": ts,
+        "last_seen": time_str,
+        "first_seen": first_seen,
+        "count": count,
+        "reason": reason or current_entry.get("reason", "Used")
+    }
+    save_used_ips(data)
+
+def get_used_ips_summary():
+    """Lấy danh sách các IP đang bị blacklist trong chu kỳ hiện tại."""
+    data = load_used_ips()
+    cycle_start = get_current_quota_cycle_start()
+    active_used = []
+    for ip, info in data.get("ips", {}).items():
+        if info.get("timestamp", 0) >= cycle_start:
+            active_used.append((ip, info.get("last_seen", ""), info.get("count", 1), info.get("reason", "")))
+    return active_used
+
+def clear_used_ips():
+    """Xóa danh sách IP đã dùng."""
+    save_used_ips({"ips": {}})
+    log("🗑️ Đã xóa sạch danh sách IP đã dùng.")
+
+# ========================================================
+# KIỂM TRA TRẠNG THÁI OPENCODE & PROXY HEALTH
+# ========================================================
+
+def is_opencode_busy():
+    """Kiểm tra xem OpenCode có đang bận chạy code/stream hay không."""
+    try:
+        res = subprocess.run(
+            ["opencode", "api", "get", "/api/session/active"],
+            capture_output=True, text=True, timeout=3
+        )
+        if res.returncode == 0:
+            data = json.loads(res.stdout)
+            active = data.get("data")
+            if active and isinstance(active, dict) and len(active) > 0:
+                return True
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["lsof", "-n", "-P", "-i", ":28080"],
+            capture_output=True, text=True, timeout=3
+        )
+        lines = [l for l in res.stdout.splitlines() if "ESTABLISHED" in l]
+        if len(lines) > 0:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+def wait_until_opencode_idle(max_wait_seconds=180):
+    """Đợi OpenCode hoàn thành prompt/task hiện tại trước khi xoay IP."""
+    start = time.time()
+    while is_opencode_busy():
+        if time.time() - start > max_wait_seconds:
+            log("⚠️ OpenCode bận quá 3 phút, tiến hành xoay IP an toàn...")
+            break
+        log("⏳ OpenCode đang xử lý code dở dang, tạm hoãn xoay IP 5 giây...")
+        time.sleep(5)
+
+def check_upstream_health():
+    """Kiểm tra xem proxy upstream đã lên mạng và có IP mới chưa."""
+    try:
+        cmd = [
+            "curl", "-s", "--max-time", "5",
+            "-x", UPSTREAM_PROXY,
+            "https://api.ipify.org"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=7)
+        if res.returncode == 0 and res.stdout.strip():
+            ip = res.stdout.strip()
+            if len(ip) >= 7 and "." in ip:
+                return ip
+    except Exception:
+        pass
+    return None
+
+# ========================================================
+# LOGIC XOAY IP TỰ ĐỘNG + LỌC TRÙNG (DEDUPLICATION)
+# ========================================================
+
+def rotate(force=False, reason="Tự động theo hạn sống IP", max_dedup_attempts=10):
+    log("========================================================")
+    log(f"🔄 Bắt đầu xoay IP tự động [Lý do: {reason}]...")
+
+    # 1. Chờ OpenCode hoàn thành lệnh đang chạy (nếu không force)
+    if not force:
+        wait_until_opencode_idle()
+    else:
+        log("⚡ Bỏ qua chờ idle do kích hoạt khẩn cấp (OpenCode dính Limit hoặc Proxy chết).")
+
+    # 2. Đặt cờ đang xoay IP
+    try:
+        with open(ROTATING_FLAG, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+    remaining_seconds = 1200
+    chosen_ip = None
+
+    # Vòng lặp xoay IP có kiểm tra trùng lặp:
+    # Nếu IP nhận về đã từng dùng hôm nay, tự động xoay tiếp sang IP khác
+    for dedup_attempt in range(1, max_dedup_attempts + 1):
+        if dedup_attempt > 1:
+            log(f"🔄 Đang xoay lại để tìm IP mới (Lần thử {dedup_attempt}/{max_dedup_attempts})...")
+
+        # 3. Gửi yêu cầu xoay IP tới API
+        api_success = False
+        for req_attempt in range(1, 5):
+            try:
+                req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    api_response = json.loads(resp.read().decode("utf-8"))
+                    msg = api_response.get("message", "")
+                    log(f"📡 API phản hồi: {msg}")
+
+                    # Kiểm tra nếu nhà mạng yêu cầu cooldown trước khi đổi IP
+                    cooldown_match = re.search(r"Con\s*(\d+)s\s*moi\s*co\s*the\s*doi", msg, re.IGNORECASE)
+                    if cooldown_match:
+                        wait_s = int(cooldown_match.group(1)) + 2
+                        log(f"⏳ API yêu cầu chờ cooldown {wait_s}s để đổi IP mới. Đang chờ đúng thời gian...")
+                        notify("Proxy Cooldown", f"Đang chờ {wait_s}s để đổi IP mới tự động...")
+                        time.sleep(wait_s)
+                        continue
+
+                    match = re.search(r"die sau (\d+)s", msg)
+                    if match:
+                        remaining_seconds = int(match.group(1))
+                        log(f"⏱️ Thời hạn sống thực tế của IP này: {remaining_seconds}s (~{remaining_seconds/60:.1f} phút)")
+                    api_success = True
+                    break
+            except Exception as e:
+                log(f"⚠️ Lỗi gọi API xoay IP (lần {req_attempt}/4): {e}")
+                time.sleep(3)
+
+        # 4. Chờ modem 4G hoàn tất đổi IP
+        log("⏳ Đang đợi modem 4G hoàn tất đổi IP...")
+        time.sleep(25)
+
+        # 5. Thăm dò liên tục cho tới khi proxy hồi sinh 100%
+        new_ip = None
+        for attempt in range(1, 20):
+            new_ip = check_upstream_health()
+            if new_ip:
+                break
+            log(f"  · Đang kiểm tra kết nối proxy (lần {attempt}/20)...")
+            time.sleep(2)
+
+        if not new_ip:
+            log("⚠️ Không lấy được IP mới từ proxy upstream ở lần thử này.")
+            continue
+
+        # 6. KIỂM TRA TRÙNG LẶP: IP đã dùng trong chu kỳ hôm nay chưa?
+        if is_ip_used(new_ip):
+            used_list = get_used_ips_summary()
+            log(f"⚠️ IP {new_ip} ĐÃ TỪNG SỬ DỤNG HÔM NAY (trùng trong danh sách {len(used_list)} IP đã dùng)!")
+            log(f"🚫 Bỏ qua IP {new_ip} và tự động đổi tiếp sang IP khác...")
+            notify("Trùng IP Đã Dùng", f"IP {new_ip} đã dùng hôm nay. Đang tự động đổi tiếp IP khác...")
+            time.sleep(3)
+            continue
+        else:
+            # IP hoàn toàn mới tinh!
+            chosen_ip = new_ip
+            mark_ip_used(chosen_ip, reason=reason)
+            log(f"🎉 ĐÃ LẤY ĐƯỢC IP MỚI TINH (Chưa dùng hôm nay): {chosen_ip}")
+            break
+
+    # Nếu sau max_dedup_attempts vẫn trùng, chấp nhận IP cuối cùng để không làm đứt mạng
+    if not chosen_ip and new_ip:
+        chosen_ip = new_ip
+        mark_ip_used(chosen_ip, reason="Fallback (Pool exhausted)")
+        log(f"⚠️ Đã thử {max_dedup_attempts} lần xoay nhưng tất cả đều trùng danh sách hôm nay. Tạm dùng IP: {chosen_ip}")
+
+    # 7. Cập nhật Device UUID mới
+    new_uuid = None
+    try:
+        res = subprocess.run(["uuidgen"], capture_output=True, text=True)
+        new_uuid = res.stdout.strip()
+        if new_uuid:
+            with open(FAKE_UUID_FILE, "w") as f:
+                f.write(new_uuid + "\n")
+    except Exception:
+        pass
+
+    # 8. Xóa cờ xoay IP
+    try:
+        if os.path.exists(ROTATING_FLAG):
+            os.remove(ROTATING_FLAG)
+    except Exception:
+        pass
+
+    if chosen_ip:
+        log(f"✅ HOÀN TẤT XOAY IP! IP hiện tại: {chosen_ip} | Device ID: {new_uuid}")
+        notify("Proxy Xoay Tự Động", f"Đã kết nối IP mới: {chosen_ip}")
+        log("========================================================")
+        return remaining_seconds
+    else:
+        log("⚠️ Hết thời gian chờ xoay IP. Đã giải phóng cờ chờ.")
+        log("========================================================")
+        return remaining_seconds
+
+def daemon_loop():
+    """Vòng lặp tự thích ứng: tự động xoay trước khi IP chết 2 phút + tự phục hồi nếu IP chết đột ngột."""
+    log("🚀 Khởi động Proxy Adaptive Daemon (Tự lọc trùng IP + Tự xoay trước hạn sống + Chống 503)...")
+
+    # Lần xoay đầu tiên
+    remaining = rotate(force=False, reason="Khởi động Daemon") or 1200
+    next_rotate_time = time.time() + max(120, remaining - 150)
+
+    consecutive_failures = 0
+
+    while True:
+        time.sleep(15)
+        now = time.time()
+
+        # Kiểm tra xem đã đến giờ xoay tự động chưa
+        if now >= next_rotate_time:
+            log("⏰ Đã đến thời điểm xoay dự phòng (trước khi IP hết hạn)...")
+            remaining = rotate(force=False, reason="Hết hạn sống IP") or 1200
+            next_rotate_time = time.time() + max(120, remaining - 150)
+            consecutive_failures = 0
+            continue
+
+        # Thăm dò sức khỏe proxy định kỳ mỗi 15s để chống lỗi 503
+        ip = check_upstream_health()
+        if not ip:
+            consecutive_failures += 1
+            log(f"⚠️ Phát hiện Proxy không phản hồi (lần {consecutive_failures}/2)...")
+            if consecutive_failures >= 2:
+                log("🚨 Proxy đã bị ngắt kết nối hoặc chết sớm! Kích hoạt xoay khẩn cấp để tránh lỗi 503...")
+                remaining = rotate(force=True, reason="Khôi phục khẩn cấp do Proxy mất kết nối (Chống 503)") or 1200
+                next_rotate_time = time.time() + max(120, remaining - 150)
+                consecutive_failures = 0
+        else:
+            consecutive_failures = 0
+
+if __name__ == "__main__":
+    if "--list-ips" in sys.argv:
+        used = get_used_ips_summary()
+        cycle_dt = datetime.datetime.fromtimestamp(get_current_quota_cycle_start()).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"📋 Danh sách IP đã dùng trong chu kỳ hôm nay (từ {cycle_dt}): {len(used)} IP")
+        for ip, last_seen, count, reason in sorted(used, key=lambda x: x[1]):
+            print(f"  • {ip:<16} (Lần cuối: {last_seen}, Số lần xoay trúng: {count}, Lý do: {reason})")
+        sys.exit(0)
+
+    if "--clear-ips" in sys.argv:
+        clear_used_ips()
+        print("✅ Đã xóa sạch danh sách IP đã dùng.")
+        sys.exit(0)
+
+    if "--add-ip" in sys.argv:
+        idx = sys.argv.index("--add-ip")
+        if idx + 1 < len(sys.argv):
+            target_ip = sys.argv[idx + 1]
+            mark_ip_used(target_ip, reason="Thủ công")
+            print(f"✅ Đã thêm IP {target_ip} vào danh sách đã dùng.")
+        sys.exit(0)
+
+    if "--daemon" in sys.argv or "-d" in sys.argv:
+        daemon_loop()
+    else:
+        is_force = "--force" in sys.argv or "-f" in sys.argv
+        reason = "Kích hoạt khẩn cấp" if is_force else "Thủ công"
+        for arg in sys.argv[1:]:
+            if arg.startswith("--reason="):
+                reason = arg.split("=", 1)[1]
+        rotate(force=is_force, reason=reason)

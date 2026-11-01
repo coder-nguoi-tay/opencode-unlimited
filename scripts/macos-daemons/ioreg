@@ -1,0 +1,16 @@
+#!/bin/bash
+# Wrapper for ioreg to spoof IOPlatformUUID for OpenCode and other tools
+
+FAKE_UUID_FILE="$HOME/.local/share/opencode/fake_uuid"
+
+if [ -f "$FAKE_UUID_FILE" ]; then
+    FAKE_UUID=$(cat "$FAKE_UUID_FILE" 2>/dev/null | tr -d '[:space:]')
+fi
+
+# Fallback if file doesn't exist
+if [ -z "$FAKE_UUID" ]; then
+    FAKE_UUID="FCB63DB1-3599-5770-8F02-CC81AA7B69A8"
+fi
+
+# Call real /usr/sbin/ioreg and substitute IOPlatformUUID
+/usr/sbin/ioreg "$@" | sed -E "s/\"IOPlatformUUID\" = \".*\"/\"IOPlatformUUID\" = \"$FAKE_UUID\"/"

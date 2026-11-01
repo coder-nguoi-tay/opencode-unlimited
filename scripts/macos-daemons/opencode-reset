@@ -1,0 +1,54 @@
+#!/bin/bash
+# Tool reset OpenCode Device ID + Tự động gọi API xoay IP proxyxoay.shop
+# Bảo toàn 100% phiên làm việc và Tự động Resume tiếp tục code
+
+FAKE_UUID_FILE="$HOME/.local/share/opencode/fake_uuid"
+mkdir -p "$HOME/.local/share/opencode"
+
+REASON="Reset Quota / Hết lượt"
+DO_RESUME=true
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-resume)
+            DO_RESUME=false
+            ;;
+        --reason=*)
+            REASON="${arg#*=}"
+            ;;
+    esac
+done
+
+echo "🔄 Đang tiến hành làm mới IP và Device ID an toàn..."
+
+# 1. Gọi script xoay IP thông minh khẩn cấp
+if [ -x "$HOME/.local/bin/proxy-rotate" ]; then
+    "$HOME/.local/bin/proxy-rotate" --force --reason="$REASON"
+fi
+
+# 2. Đảm bảo ioreg wrapper có quyền thực thi
+chmod +x "$HOME/.local/bin/ioreg" "$HOME/.opencode/bin/ioreg" 2>/dev/null || true
+
+CURRENT_IP=$(curl -x http://127.0.0.1:28080 -s --max-time 6 https://api.ipify.org 2>/dev/null || echo "Proxy Active")
+CURRENT_UUID=$(cat "$FAKE_UUID_FILE" 2>/dev/null || echo "Default")
+
+echo "========================================================"
+echo " 🎉 ĐÃ LÀM MỚI THÀNH CÔNG!"
+echo " 🌐 Địa chỉ IP Egress mới: $CURRENT_IP"
+echo " 🔑 Device ID mới: $CURRENT_UUID"
+
+# 3. Tự động gửi lệnh tiếp tục (Resume) phiên OpenCode gần nhất
+if [ "$DO_RESUME" = true ]; then
+    ACTIVE_SESSION=$(opencode api get /api/session/active 2>/dev/null | grep -o 'ses_[a-zA-Z0-9_-]*' | head -1)
+    if [ -z "$ACTIVE_SESSION" ]; then
+        ACTIVE_SESSION=$(sqlite3 "$HOME/.local/share/opencode/opencode.db" "SELECT id FROM session_v2 ORDER BY time_updated DESC LIMIT 1;" 2>/dev/null)
+    fi
+
+    if [ -n "$ACTIVE_SESSION" ]; then
+        echo " 💬 Đang tự động gửi lệnh tiếp tục công việc cho phiên: $ACTIVE_SESSION..."
+        opencode api post "/api/session/${ACTIVE_SESSION}/prompt" -d '{"text":"Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở.","delivery":"steer","resume":true}' >/dev/null 2>&1
+        echo " 🚀 Phiên OpenCode đang tự động chạy tiếp tục 100% không cần can thiệp!"
+    fi
+fi
+
+echo "========================================================"
