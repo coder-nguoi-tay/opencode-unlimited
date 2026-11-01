@@ -1,0 +1,11 @@
+# OpenCode Unlimited .gitignore
+config.json
+used_ips.json
+fake_uuid
+*.log
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/

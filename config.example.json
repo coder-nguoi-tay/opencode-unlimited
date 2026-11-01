@@ -1,0 +1,11 @@
+{
+  "api_url": "https://proxyxoay.shop/api/get.php?key=YOUR_API_KEY",
+  "upstream_proxy": "160.250.166.20:10427",
+  "local_port": 28080,
+  "cooldown_extra_seconds": 2,
+  "stabilize_wait_seconds": 60,
+  "max_dedup_attempts": 10,
+  "auto_resume": true,
+  "auto_spoof_uuid": true,
+  "prompt_resume_text": "Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở."
+}
