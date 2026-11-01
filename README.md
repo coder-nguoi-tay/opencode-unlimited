@@ -1,58 +1,96 @@
-# 🚀 OpenCode Unlimited (Cross-Platform)
+# 🚀 OpenCode Unlimited — Hướng Dẫn Sử Dụng Chi Tiết (Full Manual)
 
-> **Giải pháp tự động hóa 100% cho OpenCode AI trên macOS, Linux và Windows.**
->
-> Tự động đổi IP khi chạm giới hạn, lọc bỏ các IP trùng lặp trong ngày, tự động chờ cooldown của modem 4G, fake Device ID, và **TỰ ĐỘNG RESUME TIẾP TỤC TASK** mà không cần con người canh bấm tiếp tục.
+> **Giải pháp tự động hóa 100% dành cho OpenCode AI trên macOS, Linux và Windows.**  
+> Tự động phát hiện lỗi hạn mức (`Free usage limit reached`, `429`, `503`, `QuotaExceeded`, `ECONNRESET`), tự động đổi IP sạch mới, lọc bỏ hoàn toàn các IP trùng lặp trong ngày, tự động chờ cooldown của nhà mạng 4G, fake Device ID và **TỰ ĐỘNG GỬI LỆNH TIẾP TỤC TASK ĐANG LÀM DỞ** mà không cần con người ngồi canh hay bấm tay.
+
+---
+
+## 📑 Mục Lục
+
+1. [Vấn Đề & Giải Pháp](#-vấn-đề--giải-pháp)
+2. [Tính Năng Nổi Bật](#-tính-năng-nổi-bật)
+3. [Cài Đặt & Chạy Siêu Tốc (Chỉ 1 Lệnh)](#-cài-đặt--chạy-siêu-tốc-chỉ-1-lệnh)
+   - [Dành cho macOS](#1-dành-cho-macos-apple-silicon--intel)
+   - [Dành cho Linux](#2-dành-cho-linux-ubuntu-debian-arch-fedora)
+   - [Dành cho Windows](#3-dành-cho-windows-10--11)
+4. [Hướng Dẫn Cấu Hình Proxy (`config.json`)](#-hướng-dẫn-cấu-hình-proxy-configjson)
+5. [Hướng Dẫn Sử Dụng Hàng Ngày](#-hướng-dẫn-sử-dụng-hàng-ngày)
+6. [Các Lệnh Tiện Ích & Quản Trị](#-các-lệnh-tiện-ích--quản-trị)
+7. [Sơ Đồ Hoạt Động (Architecture Flow)](#-sơ-đồ-hoạt-động-architecture-flow)
+8. [Cài Đặt Chạy Ẩn Như Service Nền (Persistent Daemon)](#-cài-đặt-chạy-ẩn-như-service-nền-persistent-daemon)
+9. [Câu Hỏi Thường Gặp (FAQ & Troubleshooting)](#-câu-hỏi-thường-gặp-faq--troubleshooting)
+
+---
+
+## 🎯 Vấn Đề & Giải Pháp
+
+| Vấn Đề Khi Dùng OpenCode Thường | Giải Pháp Của OpenCode Unlimited |
+| :--- | :--- |
+| **Bị ngắt quãng khi hết lượt free**: Đang code dở thì OpenCode văng thông báo `You've used today's free messages`, buộc người dùng phải dừng việc. | **Tự động bắt lỗi thời gian thực**: Watchdog nhận diện lỗi trong tích tắc và lập tức kích hoạt luồng xử lý tự động. |
+| **Phải thao tác thủ công**: Người dùng phải tự đổi IP, tự chờ mạng ổn định rồi bấm tiếp tục prompt bằng tay. | **Tự động 100% không cần người canh**: Tự đổi IP, tự chờ 60s cho mạng ổn định rồi **tự động gửi lệnh tiếp tục task** vào phiên làm việc hiện tại. |
+| **Xoay trúng IP cũ bị cạn quota**: Pool 4G của nhà mạng thường cấp lại các IP đã dùng trước đó, dẫn đến vừa đổi IP xong vẫn bị lỗi limit. | **Bộ lọc chống trùng lặp (`used_ips.json`)**: Ghi nhớ mọi IP đã dùng trong ngày. Nếu nhà mạng cấp lại IP cũ, hệ thống tự từ chối và xoay tiếp đến khi có IP mới tinh. |
+| **Lỗi Cooldown nhà mạng**: Gọi API đổi IP liên tục sẽ bị nhà mạng từ chối (`Con 30s mới có thể đổi proxy`). | **Xử lý Cooldown thông minh**: Tự phân tích số giây cooldown cần chờ, ngủ đúng thời gian rồi tự động thử lại. |
+| **Cài đặt phức tạp, phụ thuộc nhiều tool**: Cần cài GOST, cấu hình tường lửa, script rườm rà. | **Thuần Python chuẩn (Zero Dependency)**: Hoạt động ngay bằng Python 3.8+ có sẵn, không cần cài thêm bất kỳ thư viện hay phần mềm thứ ba nào. |
 
 ---
 
 ## ✨ Tính Năng Nổi Bật
 
-- ⚡ **Chạy Đúng 1 Lệnh (All-in-One)**: Hoạt động ngay tức thì trên cả **macOS**, **Linux** và **Windows** mà không cần cấu hình phức tạp.
-- 🔌 **Local Proxy Bridge Thuần Python**: Tự động chuyển tiếp traffic nội bộ từ `127.0.0.1:28080` sang Upstream Rotating Proxy bằng thư viện chuẩn của Python (`asyncio`). **Không cần cài đặt GOST hay phần mềm bên thứ 3**.
-- 🛡️ **Anti-Duplicate IP (Chống Trùng Lặp)**: Tự động lưu vết các IP đã dùng trong ngày (`used_ips.json`). Nếu nhà mạng cấp lại IP cũ đã bị chạm hạn mức, hệ thống sẽ tự động từ chối và tiếp tục đổi sang IP mới tinh.
-- ⏰ **Tự Động Reset Theo Ngày Toàn Cầu**: Hệ thống tự động đồng bộ chu kỳ làm mới với OpenCode Gateway lúc **00:00:00 UTC (đúng 7:00 AM giờ Việt Nam)** mỗi ngày.
-- ⏳ **Xử Lý Cooldown Thông Minh**: Tự động bắt thông điệp cooldown của nhà mạng 4G (`Con Xs moi co the doi proxy`), tự đếm ngược và thử lại đúng thời gian.
-- 🤖 **Auto-Resume Watchdog (100% Liền Mạch)**: Theo dõi file log OpenCode theo thời gian thực. Ngay khi phát hiện lỗi (`Free usage limit reached`, `429`, `503`, `QuotaExceeded`, `ECONNRESET`), hệ thống tự đổi IP, chờ 60 giây ổn định đường truyền rồi tự động gửi prompt tiếp tục phiên code đang làm dở.
-- 🔑 **Cross-Platform Device ID Spoofer**: Tự động tạo và làm mới Device ID / Machine UUID ngẫu nhiên tương thích trên macOS, Linux và Windows.
+- ⚡ **Chạy Đúng 1 Lệnh (All-in-One)**: Hoạt động ngay tức thì trên cả **macOS**, **Linux** và **Windows**.
+- 🔌 **Local Proxy Bridge Thuần Python (`bridge.py`)**: Lắng nghe tại `127.0.0.1:28080` và chuyển tiếp trực tiếp sang Upstream Proxy bằng `asyncio`.
+- 🛡️ **Anti-Duplicate IP Engine (`rotator.py`)**: Lọc bỏ IP trùng lặp trong chu kỳ ngày.
+- ⏰ **Đồng Bộ Chu Kỳ Reset Toàn Cầu**: Tự động làm mới danh sách IP theo mốc **00:00:00 UTC (đúng 7:00 AM giờ Việt Nam)** mỗi ngày.
+- 🤖 **Auto-Resume Watchdog (`watchdog.py`)**: Tự động bơm prompt tiếp tục phiên code dang dở ngay khi có mạng mới.
+- 🔑 **Cross-Platform Device Spoofer (`spoofer.py`)**: Tự làm mới Machine UUID / IOPlatformUUID ngẫu nhiên.
 
 ---
 
-## 🚀 Hướng Dẫn Sử Dụng (Chạy Đúng 1 Lệnh)
+## 🚀 Cài Đặt & Chạy Siêu Tốc (Chỉ 1 Lệnh)
 
-### 1. Trên macOS & Linux
+### 1. Dành cho macOS (Apple Silicon & Intel)
 
-Mở Terminal và chạy đúng 1 dòng lệnh sau:
+Mở ứng dụng **Terminal** và dán đúng một dòng lệnh sau:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/coder-nguoi-tay/opencode-unlimited/main/install.sh | bash
 ```
 
-Hoặc nếu đã clone repository:
-
-```bash
-./run.sh
-```
-
-*(Lệnh trên sẽ tự động tạo lối tắt toàn cục `opencode-unlimited`. Lần sau bạn chỉ cần gõ `opencode-unlimited` ở bất kỳ thư mục nào).*
+> **Ghi chú**: Lệnh trên sẽ tự động tải mã nguồn về thư mục `~/.opencode-unlimited` và tạo một lệnh tắt toàn cục là `opencode-unlimited`. Lần sau, bạn chỉ cần gõ:
+> ```bash
+> opencode-unlimited
+> ```
 
 ---
 
-### 2. Trên Windows (PowerShell / Command Prompt)
+### 2. Dành cho Linux (Ubuntu, Debian, Arch, Fedora)
 
-Mở **PowerShell** và chạy 1 dòng lệnh sau:
+Mở Terminal và chạy lệnh:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/coder-nguoi-tay/opencode-unlimited/main/install.sh | bash
+```
+
+---
+
+### 3. Dành cho Windows (10 & 11)
+
+Mở **PowerShell** (không cần quyền Administrator) và dán dòng lệnh sau:
 
 ```powershell
 irm https://raw.githubusercontent.com/coder-nguoi-tay/opencode-unlimited/main/install.ps1 | iex
 ```
 
-Hoặc nếu đã tải về, bạn chỉ cần **click đúp vào file `run.bat`**.
+> **Cách 2 trên Windows (Không cần gõ lệnh)**:
+> 1. Tải toàn bộ repository này về dưới dạng file `.zip` rồi giải nén.
+> 2. **Click đúp vào file `run.bat`** là chương trình sẽ tự khởi động.
 
 ---
 
-## ⚙️ Cấu Hình (`config.json`)
+## ⚙️ Hướng Dẫn Cấu Hình Proxy (`config.json`)
 
-Trong lần chạy đầu tiên, hệ thống sẽ tự động hỏi bạn API Key và Upstream Proxy nếu chưa có file cấu hình. Bạn cũng có thể chủ động chỉnh sửa file `config.json`:
+Trong lần đầu khởi chạy, chương trình sẽ hiển thị lời nhắc hỏi bạn **Link API Xoay IP** và **Upstream Proxy**.
+
+Bạn cũng có thể mở trực tiếp file `config.json` để chỉnh sửa theo ý mình:
 
 ```json
 {
@@ -67,69 +105,165 @@ Trong lần chạy đầu tiên, hệ thống sẽ tự động hỏi bạn API 
 }
 ```
 
-### Giải thích các tham số:
-| Tham số | Ý nghĩa |
+### Bảng giải thích chi tiết các tham số:
+
+| Tham số | Ý nghĩa & Hướng dẫn |
 | :--- | :--- |
-| `api_url` | Đường link gọi xoay IP (ví dụ từ `proxyxoay.shop`) |
-| `upstream_proxy` | Địa chỉ IP:Port của Proxy xoay mà nhà cung cấp cấp cho bạn |
-| `local_port` | Cổng HTTP Proxy nội bộ (mặc định: `28080`) |
-| `cooldown_extra_seconds` | Số giây chờ thêm sau khi hết cooldown của nhà mạng để đảm bảo kết nối |
-| `stabilize_wait_seconds` | Số giây chờ IP mới ổn định trước khi tự động Resume (mặc định: `60`s) |
-| `max_dedup_attempts` | Số lần thử đổi IP tối đa nếu gặp phải IP trùng lặp |
-| `auto_resume` | `true`: Tự động gửi lệnh tiếp tục task dang dở sau khi đổi IP |
-| `prompt_resume_text` | Câu lệnh nhắc gửi tới OpenCode để yêu cầu tiếp tục làm |
+| `api_url` | Đường dẫn API dùng để yêu cầu đổi IP mới do bên bán proxy cấp (ví dụ: `https://proxyxoay.shop/api/get.php?key=...`). |
+| `upstream_proxy` | Địa chỉ `IP:PORT` của proxy upstream để máy tính kết nối Internet qua đó (ví dụ: `160.250.166.20:10427`). |
+| `local_port` | Cổng Proxy cục bộ mà tool mở trên máy bạn (mặc định: `28080`). OpenCode sẽ kết nối qua cổng này. |
+| `cooldown_extra_seconds` | Số giây chờ thêm sau khi hết thời gian cooldown của nhà mạng để đảm bảo kết nối đã sẵn sàng (mặc định: `2`). |
+| `stabilize_wait_seconds` | Số giây đếm ngược chờ đường truyền và gateway OpenCode ổn định trước khi tự động gửi lệnh resume (khuyên dùng: `60` giây). |
+| `max_dedup_attempts` | Số lần tối đa tool sẽ tiếp tục xoay IP nếu gặp phải IP trùng lịch sử hôm nay (mặc định: `10` lần). |
+| `auto_resume` | `true`: Tự động gửi lệnh tiếp tục task cho phiên OpenCode đang mở. `false`: Chỉ đổi IP, không tự gửi lệnh. |
+| `prompt_resume_text` | Câu lệnh nhắc nhở gửi cho OpenCode khi kết nối lại thành công. |
 
 ---
 
-## 🛠️ Các Lệnh Tiện Ích
+## 💻 Hướng Dẫn Sử Dụng Hàng Ngày
 
-Chạy trực tiếp với `python3 main.py`:
+### Quy trình làm việc đề xuất (Đơn giản nhất):
+
+1. **Bước 1**: Mở một cửa sổ Terminal và gõ lệnh:
+   ```bash
+   opencode-unlimited
+   ```
+   *(Cửa sổ này sẽ hiển thị bảng trạng thái màu xanh, giữ vai trò làm cầu nối mạng và giám sát tự động).*
+2. **Bước 2**: Mở một tab Terminal khác (hoặc IDE của bạn) và dùng OpenCode như bình thường:
+   ```bash
+   opencode
+   ```
+3. **Bước 3**: Cứ thoải mái giao task cho OpenCode code. Khi OpenCode chạm giới hạn limit hoặc bị văng mạng, bạn **không cần làm gì cả**:
+   - Tool sẽ tự động đổi sang một IP mới tinh.
+   - Tool đếm ngược 60 giây trên màn hình.
+   - Tool tự động gửi thông báo desktop và kích hoạt phiên code chạy tiếp tục.
+
+---
+
+## 🛠️ Các Lệnh Tiện Ích & Quản Trị
+
+Bạn có thể chạy các lệnh quản trị này bất kỳ lúc nào:
 
 ```bash
-# Xem danh sách các IP đã sử dụng trong chu kỳ hôm nay
-python3 main.py --list-ips
+# 1. Xem danh sách tất cả các IP đã dùng trong ngày hôm nay
+opencode-unlimited --list-ips
 
-# Xóa trắng danh sách IP đã lưu (bắt đầu lại chu kỳ mới)
-python3 main.py --clear-ips
+# 2. Xóa sạch danh sách IP đã dùng (khi bạn muốn bắt đầu lại chu kỳ mới)
+opencode-unlimited --clear-ips
 
-# Chủ động ép đổi IP mới ngay lập tức
-python3 main.py --rotate
+# 3. Chủ động ép hệ thống xoay sang IP mới ngay lập tức
+opencode-unlimited --rotate
 
-# Khởi chạy hệ thống và tự động bật luôn giao diện OpenCode CLI
-python3 main.py --launch
+# 4. Khởi động Proxy ngầm và tự động bật luôn OpenCode CLI
+opencode-unlimited --launch
 ```
 
 ---
 
-## 🔄 Luồng Hoạt Động Của Hệ Thống
+## 🔄 Sơ Đồ Hoạt Động (Architecture Flow)
 
 ```mermaid
 flowchart TD
-    A["Bắt đầu OpenCode Task"] --> B{"OpenCode gặp lỗi Limit hoặc 503?"}
-    B -- Không --> A
-    B -- Có (Limit / 429 / 503) --> C["Watchdog phát hiện ngay lập tức"]
-    C --> D["Blacklist IP hiện tại vào used_ips.json"]
-    D --> E["Gọi API xoay IP mới"]
+    A["OpenCode đang thực hiện Task"] --> B{"Phát hiện lỗi Limit / 429 / 503?"}
+    B -- Bình thường --> A
+    B -- Có Lỗi! --> C["Watchdog kích hoạt lập tức"]
+    C --> D["Đưa IP hiện tại vào Blacklist (used_ips.json)"]
+    D --> E["Gửi yêu cầu đổi IP tới API nhà mạng"]
     E --> F{"Nhà mạng báo Cooldown?"}
-    F -- Có --> G["Tự động ngủ đúng số giây cooldown"] --> E
-    F -- Không --> H["Chờ modem 4G kết nối lại (25s)"]
-    H --> I{"IP mới có bị trùng lịch sử hôm nay?"}
-    I -- Trùng IP cũ --> J["Từ chối IP và lặp lại xoay IP khác"] --> E
-    I -- IP Mới Tinh --> K["Lưu IP vào used_ips.json & Sinh Device ID mới"]
-    K --> L["Đếm ngược 60s chờ đường truyền ổn định"]
-    L --> M["TỰ ĐỘNG GỬI PROMPT RESUME CHO PHIÊN CODE"]
-    M --> N["OpenCode tiếp tục hoàn thành task dang dở!"]
+    F -- Đang Cooldown --> G["Tự động ngủ đúng số giây yêu cầu"] --> E
+    F -- Đã Đổi IP --> H["Chờ modem 4G nạp sóng (25 giây)"]
+    H --> I{"IP mới có bị trùng lịch sử hôm nay không?"}
+    I -- Bị Trùng IP Cũ --> J["Từ chối IP này & tiếp tục xoay tìm IP khác"] --> E
+    I -- IP Mới Tinh --> K["Ghi nhận IP mới & Cấp Device ID ngẫu nhiên"]
+    K --> L["Đếm ngược 60 giây chờ đường truyền ổn định"]
+    L --> M["TỰ ĐỘNG GỬI LỆNH RESUME CHO PHIÊN OPENCODE"]
+    M --> N["OpenCode tiếp tục hoàn thành task thành công!"]
 ```
 
 ---
 
-## 📋 Yêu Cầu Hệ Thống
+## ⚙️ Cài Đặt Chạy Ẩn Như Service Nền (Persistent Daemon)
 
-- **Hệ điều hành**: macOS (Intel / Apple Silicon), Linux (Ubuntu, Debian, Arch, CentOS...), Windows 10/11.
-- **Python**: Phiên bản `>= 3.8` (Sử dụng 100% thư viện chuẩn tích hợp sẵn, không cần `pip install`).
+Nếu bạn muốn tool luôn luôn chạy ngầm mỗi khi bật máy mà không cần mở Terminal:
+
+### Trên macOS (LaunchAgent)
+
+Tạo file `~/Library/LaunchAgents/com.user.opencode-unlimited.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.opencode-unlimited</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOUR_USERNAME/.opencode-unlimited/main.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/opencode-unlimited.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/opencode-unlimited.err</string>
+</dict>
+</plist>
+```
+
+Sau đó kích hoạt bằng lệnh:
+```bash
+launchctl load -w ~/Library/LaunchAgents/com.user.opencode-unlimited.plist
+```
 
 ---
 
-## 📄 License & Tác giả
+### Trên Linux (Systemd Service)
 
-Phát triển bởi **[coder-nguoi-tay](https://github.com/coder-nguoi-tay)**. Mã nguồn mở hoàn toàn theo giấy phép MIT.
+Tạo file `~/.config/systemd/user/opencode-unlimited.service`:
+
+```ini
+[Unit]
+Description=OpenCode Unlimited Background Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.opencode-unlimited/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Kích hoạt service:
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now opencode-unlimited
+```
+
+---
+
+## ❓ Câu Hỏi Thường Gặp (FAQ & Troubleshooting)
+
+### 1. Tại sao tôi đã đổi sang IP mới tinh mà vẫn bị báo `Free usage limit reached`?
+> **Giải thích**: OpenCode thiết lập **Ngân sách dùng thử toàn cầu (Global Daily Quota)** cho toàn bộ cộng đồng trên thế giới. Vào những ngày cao điểm, khi tổng số request miễn phí của toàn bộ người dùng vượt quá ngân sách tài trợ của OpenCode, Cloudflare Gateway sẽ tạm đóng cổng dùng thử trên toàn cầu đối với mọi IP. Cổng này sẽ mở lại vào đúng **00:00:00 UTC (tức 7:00 AM sáng hôm sau giờ Việt Nam)**.  
+> 👉 *Khắc phục nếu cần code gấp trong đêm: Hãy gắn thêm API key riêng (như Gemini Flash miễn phí hoặc DeepSeek giá rẻ) vào cấu hình OpenCode.*
+
+### 2. Danh sách IP đã dùng có tự xóa khi sang ngày mới không?
+> **Có!** Hệ thống tự động tính toán mốc reset 7:00 AM mỗi ngày. Mọi IP đã dùng của ngày hôm trước sẽ tự động được xem là "sạch" và có thể tái sử dụng vào ngày hôm sau.
+
+### 3. Tool có làm lộ API Key hay IP cá nhân của tôi khi chia sẻ không?
+> **Không!** File `.gitignore` đã được cấu hình chặt chẽ để loại trừ `config.json` và `used_ips.json`. Mã nguồn đẩy lên Git chỉ chứa file mẫu `config.example.json` an toàn 100%.
+
+### 4. Tôi dùng proxy có mật khẩu (Username / Password) thì cấu hình thế nào?
+> Bạn điền dạng: `"upstream_proxy": "user:pass@host:port"` vào `config.json`.
+
+---
+
+## 📄 Bản Quyền (License)
+
+Dự án được phát triển và duy trì bởi **[coder-nguoi-tay](https://github.com/coder-nguoi-tay)** dưới giấy phép mã nguồn mở **MIT License**. Bạn có thể thoải mái sử dụng, tùy biến và chia sẻ cho cộng đồng.
