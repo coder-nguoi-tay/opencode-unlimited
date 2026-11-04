@@ -231,16 +231,23 @@ class ProxyRotator:
             if dedup_attempt > 1:
                 self.log(f"🔄 Đang xoay lại để tìm IP mới tinh (Lần thử {dedup_attempt}/{self.max_dedup_attempts})...")
 
-            # 1. Gửi request đổi IP tới API
+            # 1. Gửi request đổi IP tới API (luôn đi trực tiếp, không qua proxy)
+            direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             for req_attempt in range(1, 5):
                 try:
                     req = urllib.request.Request(self.api_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=20) as resp:
+                    with direct_opener.open(req, timeout=20) as resp:
                         content = resp.read().decode("utf-8")
                         api_response = {}
                         try:
                             api_response = json.loads(content)
                             msg = api_response.get("message", content)
+                            # Cập nhật Upstream proxy nếu API trả về cổng mới
+                            new_p = api_response.get("proxyhttp")
+                            if new_p and "::" in new_p:
+                                clean_p = new_p.split("::")[0].strip()
+                                if clean_p:
+                                    self.upstream_proxy = clean_p
                         except Exception:
                             msg = content
 

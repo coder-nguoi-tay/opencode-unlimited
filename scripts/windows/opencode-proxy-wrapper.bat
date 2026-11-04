@@ -5,6 +5,15 @@ REM  Khoi dong OpenCode Desktop voi Proxy Unlimited
 REM  Bao ve TeamViewer, AnyDesk khong bi anh huong
 REM ========================================================
 
+REM Tu dong bat he thong Proxy Bridge & Watchdog chay ngam neu chua chay
+netstat -ano | findstr ":28080 " >nul 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    if exist "%~dp0start-background.vbs" (
+        wscript.exe "%~dp0start-background.vbs"
+        ping 127.0.0.1 -n 3 >nul
+    )
+)
+
 set "HTTP_PROXY=http://127.0.0.1:28080"
 set "HTTPS_PROXY=http://127.0.0.1:28080"
 set "ALL_PROXY=http://127.0.0.1:28080"
@@ -17,7 +26,7 @@ ping 127.0.0.1 -n 2 >nul
 
 set "OPENCODE_EXE=%LOCALAPPDATA%\Programs\ai.opencode.desktop\OpenCode.exe"
 if exist "%OPENCODE_EXE%" (
-    start "" "%OPENCODE_EXE%" --proxy-server="http://127.0.0.1:28080" --proxy-bypass-list="<local>;localhost;127.0.0.1;::1;%COMPUTERNAME%" %*
+    start "" "%OPENCODE_EXE%" %*
     exit /b 0
 )
 

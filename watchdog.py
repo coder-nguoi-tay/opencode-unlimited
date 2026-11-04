@@ -294,6 +294,29 @@ class OpenCodeWatchdog:
 
         try:
             f = open(self.log_file, "r", encoding="utf-8", errors="ignore")
+            # Quét kiểm tra các dòng cuối cùng xem có lỗi limit/disconnect gần nhất chưa được xử lý không
+            try:
+                curr_size = os.path.getsize(self.log_file)
+                f.seek(max(0, curr_size - 15000), os.SEEK_SET)
+                startup_lines = f.readlines()
+                for s_line in startup_lines[-10:]:
+                    s_lower = s_line.lower()
+                    if ("free usage limit reached" in s_lower or "quotaexceeded" in s_lower or 
+                        "free messages" in s_lower or "econnreset" in s_lower) and ("failed to drain" in s_lower or "limit reached" in s_lower):
+                        s_hint = None
+                        m = re.search(r"(?:sessionID|sessionId|session\.id)=([a-zA-Z0-9_-]+)", s_line)
+                        if m:
+                            s_hint = m.group(1)
+                        self.log("⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất. Tự động chuẩn bị xử lý...")
+                        threading.Thread(
+                            target=self.handle_limit_and_resume,
+                            args=("Lỗi hạn mức phát hiện khi khởi động", s_hint, 2),
+                            daemon=True
+                        ).start()
+                        break
+            except Exception:
+                pass
+
             f.seek(0, os.SEEK_END)
             last_trigger_time = 0
             last_pos = f.tell()
@@ -324,6 +347,10 @@ class OpenCodeWatchdog:
                     continue
 
                 if not line:
+                    try:
+                        f.seek(f.tell())  # Xóa EOF indicator trên Windows C runtime
+                    except Exception:
+                        pass
                     last_pos = f.tell()
                     time.sleep(0.4)
                     continue
