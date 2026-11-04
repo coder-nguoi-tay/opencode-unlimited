@@ -13,7 +13,7 @@ set "NO_PROXY=localhost,127.0.0.1,::1,%COMPUTERNAME%,<local>"
 REM Tat tien trinh OpenCode cu de backend khoi dong lai voi Proxy va Device ID moi
 taskkill /F /IM OpenCode.exe >nul 2>nul
 taskkill /F /IM opencode-cli.exe >nul 2>nul
-timeout /t 1 /nobreak >nul
+ping 127.0.0.1 -n 2 >nul
 
 set "OPENCODE_EXE=%LOCALAPPDATA%\Programs\ai.opencode.desktop\OpenCode.exe"
 if exist "%OPENCODE_EXE%" (
