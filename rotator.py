@@ -19,6 +19,15 @@ import sys
 import re
 import platform
 import subprocess
+import shutil
+import threading
+
+# Fix mã hóa Unicode tiếng Việt trên Windows Console
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from spoofer import get_opencode_dir, generate_new_device_id
 
@@ -47,15 +56,37 @@ class ProxyRotator:
             pass
 
     def notify(self, title, message):
+        """Hiển thị thông báo trên Desktop mà không làm nghẽn tiến trình chính."""
         system = platform.system()
-        try:
-            if system == "Darwin":
-                apple_script = f'display notification "{message}" with title "{title}" sound name "Glass"'
-                subprocess.run(["osascript", "-e", apple_script], capture_output=True)
-            elif system == "Linux" and shutil.which("notify-send"):
-                subprocess.run(["notify-send", title, message], capture_output=True)
-        except Exception:
-            pass
+
+        def _send():
+            try:
+                if system == "Darwin":
+                    apple_script = f'display notification "{message}" with title "{title}" sound name "Glass"'
+                    subprocess.run(["osascript", "-e", apple_script], capture_output=True)
+                elif system == "Linux" and shutil.which("notify-send"):
+                    subprocess.run(["notify-send", title, message], capture_output=True)
+                elif system == "Windows":
+                    safe_title = title.replace("'", "").replace('"', "")
+                    safe_msg = message.replace("'", "").replace('"', "")
+                    ps_cmd = f"""
+                    [reflection.assembly]::loadwithpartialname('System.Windows.Forms') | Out-Null
+                    [reflection.assembly]::loadwithpartialname('System.Drawing') | Out-Null
+                    $notify = New-Object System.Windows.Forms.NotifyIcon
+                    $notify.Icon = [System.Drawing.SystemIcons]::Information
+                    $notify.Visible = $True
+                    $notify.ShowBalloonTip(3000, '{safe_title}', '{safe_msg}', [System.Windows.Forms.ToolTipIcon]::Info)
+                    Start-Sleep -Seconds 1
+                    $notify.Dispose()
+                    """
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                        capture_output=True, text=True, timeout=5
+                    )
+            except Exception:
+                pass
+
+        threading.Thread(target=_send, daemon=True).start()
 
     # ========================================================
     # QUẢN LÝ DEDUP & CHU KỲ QUOTA TOÀN CẦU (07:00 AM VN)
@@ -140,34 +171,44 @@ class ProxyRotator:
     # ========================================================
 
     def check_health(self, timeout=7):
-        try:
-            proxy_url = f"http://127.0.0.1:{self.local_port}"
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-            )
-            req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
-            with opener.open(req, timeout=timeout) as resp:
-                if resp.status == 200:
-                    ip = resp.read().decode("utf-8").strip()
-                    if "." in ip or ":" in ip:
-                        return ip
-        except Exception:
-            pass
+        endpoints = [
+            "https://api.ipify.org",
+            "https://icanhazip.com",
+            "https://ifconfig.me/ip"
+        ]
+        proxy_url = f"http://127.0.0.1:{self.local_port}"
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+        for ep in endpoints:
+            try:
+                req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
+                with opener.open(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        ip = resp.read().decode("utf-8").strip()
+                        if ("." in ip or ":" in ip) and len(ip) <= 45:
+                            return ip
+            except Exception:
+                pass
 
         # Fallback thử qua trực tiếp upstream
-        try:
-            upstream_url = f"http://{self.upstream_proxy}"
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": upstream_url, "https": upstream_url})
-            )
-            req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
-            with opener.open(req, timeout=timeout) as resp:
-                if resp.status == 200:
-                    ip = resp.read().decode("utf-8").strip()
-                    if "." in ip or ":" in ip:
-                        return ip
-        except Exception:
-            pass
+        clean_upstream = self.upstream_proxy
+        if "@" in clean_upstream:
+            clean_upstream = clean_upstream.split("@", 1)[1]
+        upstream_url = f"http://{clean_upstream}"
+        opener_up = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": upstream_url, "https": upstream_url})
+        )
+        for ep in endpoints[:2]:
+            try:
+                req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
+                with opener_up.open(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        ip = resp.read().decode("utf-8").strip()
+                        if ("." in ip or ":" in ip) and len(ip) <= 45:
+                            return ip
+            except Exception:
+                pass
 
         return None
 
@@ -188,6 +229,7 @@ class ProxyRotator:
                     req = urllib.request.Request(self.api_url, headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(req, timeout=20) as resp:
                         content = resp.read().decode("utf-8")
+                        api_response = {}
                         try:
                             api_response = json.loads(content)
                             msg = api_response.get("message", content)
@@ -196,10 +238,11 @@ class ProxyRotator:
 
                         self.log(f"📡 API phản hồi: {msg}")
 
-                        # Kiểm tra Cooldown
-                        cooldown_match = re.search(r"Con\s*(\d+)s\s*moi\s*co\s*the\s*doi", msg, re.IGNORECASE)
+                        # Kiểm tra Cooldown (hỗ trợ cả có dấu và không dấu tiếng Việt)
+                        cooldown_match = re.search(r"(?:Con|Còn)?\s*(\d+)\s*s\s*(?:moi|mới)?\s*co\s*the\s*doi|cooldown.*?(\d+)|doi sau (\d+)s", msg, re.IGNORECASE)
                         if cooldown_match:
-                            wait_s = int(cooldown_match.group(1)) + self.cooldown_extra_seconds
+                            raw_s = next(g for g in cooldown_match.groups() if g is not None)
+                            wait_s = int(raw_s) + self.cooldown_extra_seconds
                             self.log(f"⏳ API yêu cầu chờ cooldown {wait_s}s để đổi IP mới. Đang chờ đúng thời gian...")
                             self.notify("Proxy Cooldown", f"Đang chờ {wait_s}s để đổi IP mới...")
                             time.sleep(wait_s)
@@ -281,4 +324,4 @@ if __name__ == "__main__":
         print("✅ Đã xóa sạch danh sách IP đã dùng.")
         sys.exit(0)
 
-    rotator.rotate(force=True, reason="Chạy thủ công")
+    print("ℹ️ Chạy rotator trực tiếp. Dùng --list-ips hoặc --clear-ips.")

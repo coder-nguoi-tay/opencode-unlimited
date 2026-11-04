@@ -3,9 +3,9 @@
 OpenCode Unlimited - Master Cross-Platform Runner (1-Command All-in-One)
 Tác giả: coder-nguoi-tay
 Mục đích:
-- 1 Lệnh duy nhất chạy trơn tru trên cả macOS, Linux, Windows.
+- 1 Lệnh duy nhất chạy trơn tru trên cả macOS, Linux và Windows 10 & 11.
 - Tự động dựng Local Proxy Bridge (không cần GOST).
-- Tự động xoay IP khi hết lượt + Lọc bỏ các IP trùng lặp.
+- Tự động xoay IP khi hết lượt + Lọc bỏ các IP trùng lặp trong ngày.
 - Tự động theo dõi log và Resume task đang làm dở 100% tự động.
 """
 
@@ -17,6 +17,14 @@ import platform
 import argparse
 import subprocess
 import signal
+import threading
+
+# Fix mã hóa Unicode tiếng Việt trên Windows Console (tránh lỗi charmap/cp1252)
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from bridge import ProxyBridge
 from rotator import ProxyRotator
@@ -25,6 +33,38 @@ from spoofer import setup_spoofer
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 CONFIG_EXAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.example.json")
+
+def parse_proxy_host_port(upstream_str):
+    """Tách Host và Port từ chuỗi proxy (hỗ trợ IP:PORT, user:pass@IP:PORT, IP:PORT:user:pass, http://...)."""
+    s = str(upstream_str).strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if "@" in s:
+        s = s.split("@", 1)[1]
+    parts = s.split(":")
+    if len(parts) >= 2:
+        host = parts[0].strip()
+        port_str = parts[1].strip()
+        if port_str.isdigit():
+            return host, int(port_str)
+    return s, 8080
+
+def set_windows_system_proxy(enable=True, proxy_server="127.0.0.1:28080"):
+    """Tùy chọn thiết lập System Proxy trên Windows (HKCU không cần quyền Admin)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            if enable:
+                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy_server)
+                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, "localhost;127.0.0.1;<local>")
+            else:
+                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+    except Exception:
+        pass
 
 def load_or_init_config():
     """Đọc cấu hình hoặc khởi tạo tương tác nếu chưa có."""
@@ -35,7 +75,7 @@ def load_or_init_config():
         except Exception as e:
             print(f"⚠️ Không thể đọc {CONFIG_FILE}, dùng cấu hình mặc định: {e}")
 
-    # Nếu chưa có config.json, kiểm tra nếu có config.example.json
+    # Cấu hình mặc định
     default_config = {
         "api_url": "https://proxyxoay.shop/api/get.php?key=YOUR_API_KEY",
         "upstream_proxy": "160.250.166.20:10427",
@@ -44,7 +84,8 @@ def load_or_init_config():
         "stabilize_wait_seconds": 60,
         "max_dedup_attempts": 10,
         "auto_resume": True,
-        "prompt_resume_text": "Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở."
+        "prompt_resume_text": "Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở.",
+        "enable_system_proxy": False
     }
 
     if os.path.exists(CONFIG_EXAMPLE):
@@ -105,11 +146,12 @@ def main():
     parser.add_argument("--list-ips", action="store_true", help="Xem danh sách IP đã dùng trong chu kỳ hôm nay")
     parser.add_argument("--clear-ips", action="store_true", help="Xóa sạch danh sách IP đã dùng")
     parser.add_argument("--launch", action="store_true", help="Tự động khởi động OpenCode sau khi bật proxy")
+    parser.add_argument("--system-proxy", action="store_true", help="Bật Windows System Proxy (cho OpenCode Desktop GUI)")
     args = parser.parse_args()
 
     cfg = load_or_init_config()
 
-    # Khởi tạo rotator & spoofer
+    # Khởi tạo rotator
     rotator = ProxyRotator(
         api_url=cfg["api_url"],
         upstream_proxy=cfg["upstream_proxy"],
@@ -131,29 +173,23 @@ def main():
         print("✅ Đã xóa sạch danh sách IP đã dùng.")
         return
 
-    # Tách Host và Port của Upstream
-    upstream = cfg["upstream_proxy"]
-    if "://" in upstream:
-        upstream = upstream.split("://", 1)[1]
-    if ":" in upstream:
-        u_host, u_port = upstream.split(":", 1)
-    else:
-        u_host, u_port = upstream, 8080
+    # Tách Host và Port của Upstream an toàn
+    u_host, u_port = parse_proxy_host_port(cfg["upstream_proxy"])
 
     # 1. Khởi động Proxy Bridge
-    bridge = ProxyBridge(u_host, int(u_port), local_host="127.0.0.1", local_port=cfg["local_port"])
+    bridge = ProxyBridge(u_host, u_port, local_host="127.0.0.1", local_port=cfg["local_port"])
     bridge.start()
 
-    # 2. Sinh Device ID ban đầu
-    setup_spoofer()
+    # 2. Sinh Device ID ban đầu (và đồng bộ Registry MachineGuid trên Windows)
+    initial_device_id = setup_spoofer()
 
     # 3. Lấy IP hiện tại qua Bridge
     current_ip = bridge.check_health()
-
     print_banner(cfg, public_ip=current_ip)
 
     if args.rotate:
         rotator.rotate(force=True, reason="Chạy lệnh thủ công --rotate")
+        bridge.stop()
         return
 
     # Thiết lập biến môi trường Proxy cho phiên hiện tại
@@ -162,6 +198,12 @@ def main():
     os.environ["HTTPS_PROXY"] = proxy_url
     os.environ["ALL_PROXY"] = proxy_url
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+
+    # Tùy chọn kích hoạt Windows System Proxy
+    use_system_proxy = args.system_proxy or cfg.get("enable_system_proxy", False)
+    if use_system_proxy and platform.system() == "Windows":
+        set_windows_system_proxy(enable=True, proxy_server=f"127.0.0.1:{cfg['local_port']}")
+        print("🌐 Đã bật Windows System Proxy -> 127.0.0.1:" + str(cfg['local_port']))
 
     # 4. Khởi động Watchdog giám sát OpenCode
     watchdog = OpenCodeWatchdog(
@@ -182,11 +224,18 @@ def main():
     # 5. Nếu có cờ --launch thì gọi OpenCode trực tiếp
     if args.launch:
         opencode_bin = watchdog.opencode_bin
-        print(f"🚀 Đang mở OpenCode CLI ({opencode_bin})...\n")
+        print(f"🚀 Đang mở OpenCode ({opencode_bin})...\n")
         try:
-            subprocess.run([opencode_bin], env=os.environ)
+            if platform.system() == "Windows" and opencode_bin.lower().endswith((".cmd", ".bat")):
+                subprocess.run(["cmd.exe", "/c", opencode_bin], env=os.environ)
+            else:
+                subprocess.run([opencode_bin], env=os.environ)
         except KeyboardInterrupt:
             pass
+        finally:
+            if use_system_proxy and platform.system() == "Windows":
+                set_windows_system_proxy(enable=False)
+            bridge.stop()
         return
 
     # Vòng lặp giữ process hoạt động
@@ -195,6 +244,10 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Đang tắt OpenCode Unlimited...")
+    finally:
+        if use_system_proxy and platform.system() == "Windows":
+            set_windows_system_proxy(enable=False)
+            print("🌐 Đã khôi phục Windows System Proxy về mặc định.")
         bridge.stop()
         print("👋 Tạm biệt!")
 

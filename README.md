@@ -221,6 +221,24 @@ launchctl load -w ~/Library/LaunchAgents/com.user.opencode-unlimited.plist
 
 ---
 
+### Trên Windows (Task Scheduler & Background VBS)
+
+#### Cách 1: Chạy ẩn không cần cửa sổ đen (Khuyên dùng)
+- Click đúp vào file scripts\windows\start-background.vbs.
+- Khi cần tắt: chạy powershell -ExecutionPolicy Bypass -File scripts\windows\stop-background.ps1.
+
+#### Cách 2: Tự động khởi động ngầm cùng Windows (Khuyên dùng cho máy cá nhân)
+- Mở PowerShell trong thư mục project và chạy:
+`powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\install-autostart.ps1
+`
+- Khi muốn gỡ bỏ:
+`powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall-autostart.ps1
+`
+
+---
+
 ### Trên Linux (Systemd Service)
 
 Tạo file `~/.config/systemd/user/opencode-unlimited.service`:

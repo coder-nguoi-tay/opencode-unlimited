@@ -3,10 +3,10 @@
 OpenCode Unlimited - Watchdog & Auto-Resume Engine
 Tác giả: coder-nguoi-tay
 Mục đích:
-- Giám sát file opencode.log trong thời gian thực trên mọi hệ điều hành.
+- Giám sát file opencode.log trong thời gian thực trên mọi hệ điều hành (macOS, Linux, Windows 10 & 11).
 - Phát hiện tức thì các lỗi: 429, 503, QuotaExceeded, today's free messages, ECONNRESET.
 - Tự động gọi rotator để cấp IP mới sạch (không trùng lặp).
-- Chờ 60 giây để đường truyền và hệ thống ổn định hoàn toàn.
+- Chờ đường truyền và hệ thống ổn định hoàn toàn.
 - TỰ ĐỘNG GỬI PROMPT TIẾP TỤC (RESUME) cho phiên làm việc hiện tại mà không cần thao tác tay.
 """
 
@@ -21,6 +21,14 @@ import threading
 import subprocess
 import platform
 import shutil
+import glob
+
+# Fix mã hóa Unicode tiếng Việt trên Windows Console
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from spoofer import get_opencode_dir
 
@@ -43,25 +51,72 @@ class OpenCodeWatchdog:
         self.running = False
 
     def _find_opencode_binary(self):
-        system = platform.system()
+        """Tìm đường dẫn binary thực thi của OpenCode trên hệ thống."""
         # 1. Thử qua PATH
-        found = shutil.which("opencode")
-        if found:
-            return found
+        for cmd_name in ["opencode", "opencode-cli", "OpenCode"]:
+            found = shutil.which(cmd_name)
+            if found:
+                return found
 
-        # 2. Thử các đường dẫn mặc định
         home = os.path.expanduser("~")
-        candidates = [
+        candidates = []
+
+        # 2. Các đường dẫn đặc thù của Windows
+        if platform.system() == "Windows":
+            local_app = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+            roaming_app = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+            prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+
+            # Tìm trong CLI bundled của OpenCode Desktop (Roaming)
+            cli_glob = os.path.join(roaming_app, "ai.opencode.desktop", "cli", "*", "opencode-cli.exe")
+            matching_clis = sorted(glob.glob(cli_glob), reverse=True)
+            candidates.extend(matching_clis)
+
+            # Tìm trong Programs của OpenCode Desktop
+            candidates.append(os.path.join(local_app, "Programs", "ai.opencode.desktop", "resources", "opencode-cli.exe"))
+            candidates.append(os.path.join(local_app, "Programs", "ai.opencode.desktop", "OpenCode.exe"))
+            candidates.append(os.path.join(local_app, "Programs", "opencode", "opencode.exe"))
+            candidates.append(os.path.join(local_app, "Programs", "opencode", "resources", "opencode-cli.exe"))
+
+            # Tìm npm / scoop / chocolatey
+            candidates.append(os.path.join(roaming_app, "npm", "opencode.cmd"))
+            candidates.append(os.path.join(roaming_app, "npm", "opencode-cli.cmd"))
+            candidates.append(os.path.join(home, "scoop", "shims", "opencode.exe"))
+            candidates.append(os.path.join(prog_files, "OpenCode", "opencode.exe"))
+
+        # 3. Các đường dẫn mặc định trên macOS / Linux / XDG
+        candidates.extend([
             os.path.join(home, ".local", "bin", "opencode"),
             os.path.join(home, ".opencode", "bin", "opencode"),
             os.path.join(home, ".opencode", "bin", "opencode.exe"),
-            os.path.join(home, "AppData", "Local", "Programs", "opencode", "opencode.exe"),
-        ]
+            "/usr/local/bin/opencode",
+            "/opt/homebrew/bin/opencode",
+        ])
+
         for c in candidates:
             if os.path.exists(c):
                 return c
 
         return "opencode"
+
+    def _run_cmd(self, args, timeout=10):
+        """Chạy lệnh binary của OpenCode tương thích Windows (.cmd / .exe) và Unix."""
+        is_windows = platform.system() == "Windows"
+        is_batch = is_windows and self.opencode_bin.lower().endswith((".cmd", ".bat"))
+
+        if is_batch:
+            full_cmd = ["cmd.exe", "/c", self.opencode_bin] + args[1:]
+        else:
+            full_cmd = args
+
+        return subprocess.run(
+            full_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout
+        )
 
     def log(self, msg):
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -76,10 +131,7 @@ class OpenCodeWatchdog:
     def get_active_sessions(self):
         """Lấy danh sách các session đang chạy từ API của OpenCode."""
         try:
-            res = subprocess.run(
-                [self.opencode_bin, "api", "get", "/api/session/active"],
-                capture_output=True, text=True, timeout=5
-            )
+            res = self._run_cmd([self.opencode_bin, "api", "get", "/api/session/active"], timeout=5)
             if res.returncode == 0:
                 data = json.loads(res.stdout)
                 active = data.get("data", {})
@@ -90,19 +142,44 @@ class OpenCodeWatchdog:
         return []
 
     def get_latest_session_id(self):
-        """Lấy session ID gần nhất từ database SQLite của OpenCode."""
+        """Lấy session ID gần nhất từ database SQLite của OpenCode (mở chế độ read-only an toàn)."""
         if not os.path.exists(self.db_file):
             return None
+        conn = None
         try:
-            conn = sqlite3.connect(self.db_file, timeout=3)
+            # Trên Windows dùng URI read-only để tránh conflict với SQLite WAL mode
+            db_uri = f"file:{os.path.abspath(self.db_file)}?mode=ro"
+            try:
+                conn = sqlite3.connect(db_uri, uri=True, timeout=3)
+            except Exception:
+                conn = sqlite3.connect(self.db_file, timeout=3)
+
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM session_v2 ORDER BY time_updated DESC LIMIT 1;")
-            row = cursor.fetchone()
-            conn.close()
-            if row:
-                return row[0]
+            # Thử bảng session_v2 (OpenCode hiện đại)
+            try:
+                cursor.execute("SELECT id FROM session_v2 ORDER BY time_updated DESC LIMIT 1;")
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+            except Exception:
+                pass
+
+            # Fallback bảng session cũ nếu có
+            try:
+                cursor.execute("SELECT id FROM session ORDER BY updated_at DESC LIMIT 1;")
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+            except Exception:
+                pass
         except Exception:
             pass
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return None
 
     def send_resume_prompt(self, session_id):
@@ -113,18 +190,19 @@ class OpenCodeWatchdog:
                 "text": self.prompt_resume_text,
                 "delivery": "steer",
                 "resume": True
-            })
+            }, ensure_ascii=False)
+
             cmd = [
                 self.opencode_bin, "api", "post",
                 f"/api/session/{session_id}/prompt",
                 "-d", body
             ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            res = self._run_cmd(cmd, timeout=15)
             if res.returncode == 0:
                 self.log(f"✅ Gửi lệnh tiếp tục thành công! Phiên {session_id} đang chạy tiếp.")
                 return True, res.stdout
             else:
-                self.log(f"⚠️ Lỗi khi gửi lệnh tiếp tục (code {res.returncode}): {res.stderr or res.stdout}")
+                self.log(f"⚠️ Phản hồi khi gửi lệnh tiếp tục (code {res.returncode}): {res.stderr or res.stdout}")
                 return False, res.stderr or res.stdout
         except Exception as e:
             self.log(f"⚠️ Ngoại lệ khi gửi lệnh tiếp tục: {e}")
@@ -211,16 +289,42 @@ class OpenCodeWatchdog:
 
         if not os.path.exists(self.log_file):
             os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-            open(self.log_file, "a").close()
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                pass
 
         try:
             f = open(self.log_file, "r", encoding="utf-8", errors="ignore")
             f.seek(0, os.SEEK_END)
             last_trigger_time = 0
+            last_pos = f.tell()
 
             while self.running:
-                line = f.readline()
+                # Kiểm tra nếu file bị xoay hoặc truncate
+                try:
+                    curr_size = os.path.getsize(self.log_file)
+                    if curr_size < last_pos:
+                        f.seek(0, os.SEEK_SET)
+                        last_pos = 0
+                except FileNotFoundError:
+                    time.sleep(1)
+                    try:
+                        f.close()
+                        f = open(self.log_file, "r", encoding="utf-8", errors="ignore")
+                        f.seek(0, os.SEEK_END)
+                        last_pos = f.tell()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                try:
+                    line = f.readline()
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+
                 if not line:
+                    last_pos = f.tell()
                     time.sleep(0.4)
                     continue
 
@@ -243,6 +347,9 @@ class OpenCodeWatchdog:
                 elif "provider.free-limit" in line_lower:
                     is_trigger = True
                     reason = "provider.free-limit"
+                elif "resource_exhausted" in line_lower or "usage limit exceeded" in line_lower:
+                    is_trigger = True
+                    reason = "Resource Exhausted / Usage Limit Exceeded"
                 elif 'status":429' in line or 'status": 429' in line or "http 429" in line_lower or "ratelimit" in line_lower:
                     is_trigger = True
                     reason = "HTTP 429 RateLimit"
@@ -260,11 +367,11 @@ class OpenCodeWatchdog:
                     last_trigger_time = now
 
                     session_hint = None
-                    m1 = re.search(r"sessionID=([a-zA-Z0-9_-]+)", line)
+                    m1 = re.search(r"(?:sessionID|sessionId|session\.id)=([a-zA-Z0-9_-]+)", line)
                     if m1:
                         session_hint = m1.group(1)
                     else:
-                        m2 = re.search(r"session\.id=([a-zA-Z0-9_-]+)", line)
+                        m2 = re.search(r"\b(ses_[a-zA-Z0-9]{15,})\b", line)
                         if m2:
                             session_hint = m2.group(1)
 
@@ -283,3 +390,16 @@ class OpenCodeWatchdog:
             self.log(f"❌ Watchdog gặp lỗi: {e}")
         finally:
             self.running = False
+            try:
+                f.close()
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    from rotator import ProxyRotator
+    rotator = ProxyRotator("https://proxyxoay.shop/api/get.php?key=test")
+    watchdog = OpenCodeWatchdog(rotator)
+    print(f"Binary: {watchdog.opencode_bin}")
+    print(f"Log: {watchdog.log_file}")
+    print(f"Latest Session: {watchdog.get_latest_session_id()}")
+    print(f"Active Sessions: {watchdog.get_active_sessions()}")
