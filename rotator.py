@@ -193,6 +193,8 @@ class ProxyRotator:
 
         # Fallback thử qua trực tiếp upstream
         clean_upstream = self.upstream_proxy
+        if "://" in clean_upstream:
+            clean_upstream = clean_upstream.split("://", 1)[1]
         if "@" in clean_upstream:
             clean_upstream = clean_upstream.split("@", 1)[1]
         upstream_url = f"http://{clean_upstream}"
