@@ -49,6 +49,7 @@ class OpenCodeWatchdog:
         self.lock = threading.Lock()
         self.is_handling = False
         self.running = False
+        self.current_ip_expire_time = 0
 
     def _find_opencode_binary(self):
         """Tìm đường dẫn binary thực thi của OpenCode trên hệ thống."""
@@ -244,22 +245,35 @@ class OpenCodeWatchdog:
 
             # 4. Kích hoạt xoay IP lọc trùng
             self.rotator.notify("OpenCode Auto-Resume", "Đang tự động đổi IP sạch mới...")
-            success, new_ip, _ = self.rotator.rotate(force=True, reason=f"Hết quota trên session {target_session or 'active'}")
+            success, new_ip, remaining_seconds = self.rotator.rotate(force=True, reason=f"Hết quota trên session {target_session or 'active'}")
 
             if not success or not new_ip:
                 self.log("❌ Không thể kết nối IP mới sau khi xoay. Tạm hoãn gửi prompt.")
                 return
 
-            # 5. Đợi thời gian ổn định IP
-            self.log(f"⏳ Đã có IP mới ({new_ip}). Đang đợi {self.stabilize_wait_seconds}s để đường truyền ổn định...")
-            self.rotator.notify("OpenCode Auto-Resume", f"Đã có IP mới ({new_ip}). Đang chờ {self.stabilize_wait_seconds}s...")
+            if remaining_seconds and remaining_seconds > 0:
+                self.current_ip_expire_time = time.time() + remaining_seconds
 
-            rem = self.stabilize_wait_seconds
-            step = 15
-            while rem > 0:
-                self.log(f"   ⏱️ Còn {rem}s nữa sẽ tự động gửi lệnh tiếp tục task...")
-                time.sleep(min(step, rem))
-                rem -= step
+            # 5. Đợi đường truyền ổn định với cơ chế Dynamic Fast Health Probe (tiết kiệm thời gian)
+            self.log(f"⏳ Đã có IP mới ({new_ip}). Đang thăm dò độ ổn định đường truyền...")
+            self.rotator.notify("OpenCode Auto-Resume", f"Đã có IP mới ({new_ip}). Đang kiểm tra kết nối...")
+
+            # Đợi tối thiểu 10s để modem/trạm phát 4G hoàn tất định tuyến
+            time.sleep(10)
+            probe_success = False
+            for probe_i in range(1, 4):
+                probe_ip = self.rotator.check_health()
+                if probe_ip:
+                    self.log(f"⚡ Đường truyền đã thông suốt và ổn định (Thăm dò {probe_i}/3 thành công, IP: {probe_ip})!")
+                    probe_success = True
+                    break
+                self.log(f"   ⏱️ Đường truyền chưa thông, đang đợi thêm 10s (lần {probe_i}/3)...")
+                time.sleep(10)
+
+            if not probe_success:
+                fallback_wait = min(15, self.stabilize_wait_seconds)
+                self.log(f"⚠️ Thăm dò chưa có phản hồi ngay, đợi thêm {fallback_wait}s an toàn...")
+                time.sleep(fallback_wait)
 
             # 6. Tự động gửi prompt tiếp tục nếu được bật
             if self.auto_resume and target_session:
@@ -352,6 +366,21 @@ class OpenCodeWatchdog:
                     except Exception:
                         pass
                     last_pos = f.tell()
+
+                    # Kiểm tra Proactive TTL: Nếu proxy 4G sắp hết hạn sống (còn < 45s) và OpenCode đang nhàn rỗi
+                    now = time.time()
+                    if self.current_ip_expire_time > 0 and now > (self.current_ip_expire_time - 45):
+                        if (now - last_trigger_time) > 45 and not self.is_handling:
+                            self.log("⏱️ Proxy 4G sắp hết hạn sống (còn < 45s). Đang chủ động xoay IP trước để tránh gián đoạn...")
+                            last_trigger_time = now
+                            self.current_ip_expire_time = 0
+                            t = threading.Thread(
+                                target=self.handle_trigger,
+                                args=("Chủ động xoay IP trước khi proxy hết hạn (Proactive TTL)", None, 0),
+                                daemon=True
+                            )
+                            t.start()
+
                     time.sleep(0.4)
                     continue
 
