@@ -21,6 +21,10 @@ import platform
 import subprocess
 import shutil
 import threading
+import socket
+
+# Đặt timeout toàn cục cho socket để không bao giờ bị treo vĩnh viễn
+socket.setdefaulttimeout(10.0)
 
 # Fix mã hóa Unicode tiếng Việt trên Windows Console
 if sys.platform == "win32":
@@ -170,11 +174,13 @@ class ProxyRotator:
     # HEALTH CHECK & XOAY IP
     # ========================================================
 
-    def check_health(self, timeout=7):
+    def check_health(self, timeout=5):
         endpoints = [
+            "http://api.ipify.org",
+            "http://icanhazip.com",
             "https://api.ipify.org",
             "https://icanhazip.com",
-            "https://ifconfig.me/ip"
+            "http://ifconfig.me/ip"
         ]
         proxy_url = f"http://127.0.0.1:{self.local_port}"
         opener = urllib.request.build_opener(
@@ -201,7 +207,7 @@ class ProxyRotator:
         opener_up = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": upstream_url, "https": upstream_url})
         )
-        for ep in endpoints[:2]:
+        for ep in endpoints[:3]:
             try:
                 req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
                 with opener_up.open(req, timeout=timeout) as resp:

@@ -18,6 +18,9 @@ import logging
 import platform
 import sys
 
+# Đặt timeout toàn cục cho socket để không bao giờ bị treo vĩnh viễn
+socket.setdefaulttimeout(10.0)
+
 # Fix mã hóa Unicode tiếng Việt trên Windows Console
 if sys.platform == "win32":
     if hasattr(sys.stdout, "reconfigure"):
@@ -40,12 +43,13 @@ class ProxyBridge:
     async def _pipe(self, reader, writer):
         try:
             while self.running and not reader.at_eof():
-                data = await reader.read(16384)
+                # Chống treo kết nối zombie với timeout 90s
+                data = await asyncio.wait_for(reader.read(16384), timeout=90.0)
                 if not data:
                     break
                 writer.write(data)
                 await writer.drain()
-        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
         except Exception:
             pass
@@ -138,12 +142,14 @@ class ProxyBridge:
                 except Exception:
                     pass
 
-    def check_health(self, timeout=7):
-        """Kiểm tra xem kết nối qua bridge có sống và lấy IP Public không (hỗ trợ nhiều endpoint dự phòng)."""
+    def check_health(self, timeout=5):
+        """Kiểm tra xem kết nối qua bridge có sống và lấy IP Public không (ưu tiên HTTP nhanh, dự phòng HTTPS)."""
         endpoints = [
+            "http://api.ipify.org",
+            "http://icanhazip.com",
             "https://api.ipify.org",
             "https://icanhazip.com",
-            "https://ifconfig.me/ip"
+            "http://ifconfig.me/ip"
         ]
         proxy_url = f"http://{self.local_host}:{self.local_port}"
         opener = urllib.request.build_opener(
