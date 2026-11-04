@@ -74,17 +74,30 @@ try {
     # Bo qua neu khong the ghi bien moi truong User
 }
 
-# 4. Tao Desktop Shortcut
+# 4. Tao Desktop Shortcuts
 try {
     $WshShell = New-Object -ComObject WScript.Shell
     $DesktopPath = [Environment]::GetFolderPath("Desktop")
     if (Test-Path $DesktopPath) {
+        # Shortcut 1: Chay he thong Proxy Bridge & Watchdog
         $ShortcutPath = Join-Path $DesktopPath "OpenCode Unlimited.lnk"
         $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
         $Shortcut.TargetPath = (Join-Path $TargetDir "run.bat")
         $Shortcut.WorkingDirectory = $TargetDir
         $Shortcut.Description = "OpenCode Unlimited Automation for Windows"
         $Shortcut.Save()
+
+        # Shortcut 2: Mo thang OpenCode Desktop da gan Proxy
+        $ProxyAppPath = Join-Path $DesktopPath "OpenCode (Proxy Unlimited).lnk"
+        $ProxyApp = $WshShell.CreateShortcut($ProxyAppPath)
+        $ProxyApp.TargetPath = (Join-Path $TargetDir "scripts\windows\opencode-proxy-wrapper.bat")
+        $ProxyApp.WorkingDirectory = $TargetDir
+        $ProxyApp.Description = "OpenCode Desktop with Proxy Unlimited"
+        $OpenCodeExe = Join-Path $env:LOCALAPPDATA "Programs\ai.opencode.desktop\OpenCode.exe"
+        if (Test-Path $OpenCodeExe) {
+            $ProxyApp.IconLocation = "$OpenCodeExe,0"
+        }
+        $ProxyApp.Save()
     }
 } catch {
     # Bo qua neu khong tao duoc shortcut
