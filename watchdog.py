@@ -375,7 +375,7 @@ class OpenCodeWatchdog:
                             last_trigger_time = now
                             self.current_ip_expire_time = 0
                             t = threading.Thread(
-                                target=self.handle_trigger,
+                                target=self.handle_limit_and_resume,
                                 args=("Chủ động xoay IP trước khi proxy hết hạn (Proactive TTL)", None, 0),
                                 daemon=True
                             )
