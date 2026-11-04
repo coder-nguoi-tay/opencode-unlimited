@@ -20,10 +20,17 @@ import signal
 import threading
 
 # Fix mã hóa Unicode tiếng Việt trên Windows Console (tránh lỗi charmap/cp1252)
+# Đồng thời hỗ trợ pythonw.exe chạy nền không có console window (sys.stdout is None)
 if sys.platform == "win32":
-    if hasattr(sys.stdout, "reconfigure"):
+    if sys.stdout is None:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opencode_unlimited.log")
+        sys.stdout = open(log_path, "a", encoding="utf-8", buffering=1)
+    elif hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
+
+    if sys.stderr is None:
+        sys.stderr = sys.stdout if sys.stdout else open(os.devnull, "w", encoding="utf-8")
+    elif hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from bridge import ProxyBridge
