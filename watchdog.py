@@ -42,6 +42,14 @@ PRESENCE_CHECK_INTERVAL_SECONDS = 30   # Tần suất kiểm tra OpenCode còn c
 STARTUP_PENDING_CHECK_SECONDS = 5      # Tần suất kiểm tra OpenCode đã mở chưa để xử lý lỗi cũ lúc khởi động
 STARTUP_PENDING_WINDOW_SECONDS = 120   # Quá thời gian này mà OpenCode chưa mở thì bỏ qua lỗi cũ trong log
 
+# Proxy Health Monitor: khi proxy chết, OpenCode chỉ tự thử lại ("Attempt N - retrying") mà không
+# ghi gì vào log cho tới khi bỏ cuộc - có thể mất vài phút. Nên watchdog tự thăm dò proxy định kỳ.
+PROXY_HEALTH_INTERVAL_SECONDS = 20     # Tần suất thăm dò proxy khi OpenCode đang mở
+PROXY_HEALTH_RETRY_SECONDS = 5         # Thăm dò lại nhanh sau một lần lỗi
+PROXY_DEAD_THRESHOLD = 2               # Số lần lỗi liên tiếp để coi proxy đã chết
+PROXY_DEAD_BACKOFF_MAX_SECONDS = 600   # Xoay IP thất bại liên tục (VD: key API hỏng) thì giãn dần, tối đa 10 phút
+RECENT_ROTATION_SECONDS = 120          # ECONNRESET tới trong khoảng này sau khi vừa xoay xong là lỗi của IP cũ
+
 class OpenCodeWatchdog:
     def __init__(self, rotator, stabilize_wait_seconds=60, auto_resume=True,
                  prompt_resume_text="Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở."):
@@ -58,8 +66,15 @@ class OpenCodeWatchdog:
         self.opencode_bin = self._find_opencode_binary()
         self.lock = threading.Lock()
         self.is_handling = False
+        self.handling_kind = None             # "resume" (xoay + gửi tiếp tục) | "rotate_only" (xoay nền)
+        self.pending_resume = None            # (reason, session_hint) bị lỗi trong lúc đang xoay nền
         self.running = False
         self.current_ip_expire_time = 0
+        self.last_rotation_ok_at = 0
+        self._probe_running = False
+        self._proxy_fail_count = 0
+        self._dead_proxy_failures = 0
+        self._next_probe_at = 0
         self.session_retries = {}             # session_id -> int
         self.circuit_broken_sessions = set()  # Các session bị khóa auto-resume để chống lặp vô tận
         self.consecutive_global_limits = 0
@@ -272,41 +287,149 @@ class OpenCodeWatchdog:
             self.log(f"⚠️ Ngoại lệ khi gửi lệnh tiếp tục: {e}")
             return False, str(e)
 
-    def handle_proactive_ttl(self):
-        """Chủ động xoay IP khi proxy 4G sắp hết hạn sống (TTL).
-        LƯU Ý: Chỉ xoay IP nền và cập nhật bộ đếm thời gian, tuyệt đối không
-        tự ý bơm prompt resume vào các session đang rảnh hoặc đã kết thúc."""
+    def _record_rotation(self, remaining_seconds):
+        """Ghi nhận một lần xoay IP thành công (hẹn giờ Proactive TTL + mốc vừa xoay)."""
+        self.last_rotation_ok_at = time.time()
+        if remaining_seconds and remaining_seconds > 0:
+            self.current_ip_expire_time = time.time() + remaining_seconds
+
+    def restore_ip_expiry(self):
+        """Khôi phục hạn sống của IP đang dùng sau khi tool khởi động lại.
+        Không có bước này thì Proactive TTL bị tắt cho tới lần xoay kế tiếp và IP cứ thế chết."""
+        state = self.rotator.load_ip_state()
+        ip, expire_at = state.get("ip"), state.get("expire_at")
+        if not ip or not isinstance(expire_at, (int, float)):
+            return
+        current_ip = self.rotator.check_health(timeout=3, quick=True)
+        if current_ip != ip:
+            # IP đã đổi (hoặc proxy đang chết) - hạn đã lưu không còn đúng, Health Monitor sẽ lo
+            return
+        self.current_ip_expire_time = float(expire_at)
+        left = int(expire_at - time.time())
+        if left > 0:
+            self.log(f"⏱️ Khôi phục hạn sống IP {ip}: còn ~{left}s (~{left/60:.1f} phút).")
+        else:
+            self.log(f"⏱️ IP {ip} đã quá hạn sống {-left}s - sẽ chủ động xoay IP mới khi OpenCode đang mở.")
+
+    def _rotate_in_background(self, headline, reason, notice):
+        """Xoay IP nền (Proactive TTL / proxy chết): chỉ đổi IP và cập nhật hẹn giờ, tuyệt đối không
+        tự ý bơm prompt resume vào các session đang rảnh hoặc đã kết thúc.
+        Nếu trong lúc xoay mà OpenCode báo một session bị lỗi (bỏ cuộc), lệnh tiếp tục cho session
+        đó được gửi ngay khi xoay xong (thay vì bị bỏ qua như trigger trùng lặp).
+        Trả về True nếu xoay thành công, None nếu đang bận xử lý việc khác."""
         with self.lock:
             if self.is_handling:
-                return
+                return None
             self.is_handling = True
+            self.handling_kind = "rotate_only"
 
+        success = False
         try:
             self.log("========================================================")
-            self.log("⏱️ [PROACTIVE TTL] Proxy 4G sắp hết hạn sống (< 45s). Đang chủ động xoay IP mới...")
-            self.rotator.notify("OpenCode Proactive TTL", "Đang chủ động đổi IP sạch mới trước khi proxy hết hạn...")
-            success, new_ip, remaining_seconds = self.rotator.rotate(force=True, reason="Chủ động xoay IP (Proactive TTL)")
+            self.log(headline)
+            self.rotator.notify(*notice)
+            ok, new_ip, remaining_seconds = self.rotator.rotate(force=True, reason=reason)
+            success = bool(ok and new_ip)
 
-            if success and new_ip:
-                if remaining_seconds and remaining_seconds > 0:
-                    self.current_ip_expire_time = time.time() + remaining_seconds
-                self.log(f"✅ Đã chủ động cập nhật IP mới ({new_ip}) thành công! Mọi kết nối sẽ tự động định tuyến qua IP mới.")
+            if success:
+                self._record_rotation(remaining_seconds)
+                self.log(f"✅ Đã cập nhật IP mới ({new_ip}) thành công! Mọi kết nối sẽ tự động định tuyến qua IP mới.")
             else:
-                self.log("⚠️ Không thể đổi IP proactive mới, sẽ thử lại ở chu kỳ tiếp theo.")
+                self.log("⚠️ Không thể đổi IP mới, sẽ thử lại ở chu kỳ tiếp theo.")
             self.log("========================================================")
         except Exception as e:
-            self.log(f"❌ Lỗi trong Proactive TTL: {e}")
+            self.log(f"❌ Lỗi khi xoay IP nền: {e}")
         finally:
             with self.lock:
-                self.is_handling = False
+                pending = self.pending_resume
+                self.pending_resume = None
+                if pending:
+                    self.handling_kind = "resume"  # Giữ nguyên khóa, chuyển thẳng sang gửi lệnh tiếp tục
+                else:
+                    self.is_handling = False
+                    self.handling_kind = None
+            if pending:
+                self.log("▶️ Đã xoay IP xong - xử lý tiếp phiên bị lỗi trong lúc đang xoay.")
+                self._limit_and_resume_body(pending[0], pending[1], 0, skip_rotation=success)
+        return success
+
+    def handle_proactive_ttl(self):
+        """Chủ động xoay IP khi proxy 4G sắp hết hạn sống (TTL)."""
+        return self._rotate_in_background(
+            "⏱️ [PROACTIVE TTL] Proxy 4G sắp hết hạn sống (< 45s). Đang chủ động xoay IP mới...",
+            "Chủ động xoay IP (Proactive TTL)",
+            ("OpenCode Proactive TTL", "Đang chủ động đổi IP sạch mới trước khi proxy hết hạn..."),
+        )
+
+    def handle_dead_proxy(self):
+        """Proxy không còn phản hồi: xoay IP ngay, không chờ OpenCode thử lại tới lúc bỏ cuộc."""
+        return self._rotate_in_background(
+            f"💀 [PROXY MONITOR] Proxy không phản hồi {PROXY_DEAD_THRESHOLD} lần liên tiếp (IP đã chết). "
+            "Đang xoay IP mới ngay, không chờ OpenCode thử lại...",
+            "Proxy mất kết nối (Health Monitor)",
+            ("OpenCode Proxy Monitor", "Proxy mất kết nối. Đang đổi IP mới..."),
+        )
+
+    def _probe_proxy_health(self):
+        """Chạy trong thread riêng: thăm dò proxy, chết PROXY_DEAD_THRESHOLD lần liên tiếp thì xoay IP."""
+        try:
+            ip = self.rotator.check_health(timeout=4, quick=True)
+            now = time.time()
+            if self.is_handling:
+                # Đang xoay IP / resume - kết quả thăm dò lúc này không có ý nghĩa
+                self._proxy_fail_count = 0
+                self._next_probe_at = now + PROXY_HEALTH_INTERVAL_SECONDS
+                return
+            if ip:
+                if self._proxy_fail_count:
+                    self.log(f"✅ Proxy đã phản hồi lại bình thường (IP: {ip}).")
+                self._proxy_fail_count = 0
+                self._dead_proxy_failures = 0
+                self._next_probe_at = now + PROXY_HEALTH_INTERVAL_SECONDS
+                return
+
+            self._proxy_fail_count += 1
+            if self._proxy_fail_count < PROXY_DEAD_THRESHOLD:
+                self.log(f"⚠️ Proxy không phản hồi (lần {self._proxy_fail_count}/{PROXY_DEAD_THRESHOLD}), "
+                         f"thăm dò lại sau {PROXY_HEALTH_RETRY_SECONDS}s...")
+                self._next_probe_at = now + PROXY_HEALTH_RETRY_SECONDS
+                return
+
+            self._proxy_fail_count = 0
+            self.current_ip_expire_time = 0  # IP đã chết - bỏ hẹn giờ TTL cũ
+            result = self.handle_dead_proxy()
+            if result is False:
+                self._dead_proxy_failures += 1
+                backoff = min(PROXY_DEAD_BACKOFF_MAX_SECONDS, 60 * (2 ** (self._dead_proxy_failures - 1)))
+                self.log(f"⏳ Xoay IP thất bại {self._dead_proxy_failures} lần liên tiếp - kiểm tra lại "
+                         f"API key / proxy. Thăm dò lại sau {backoff}s.")
+                self._next_probe_at = time.time() + backoff
+            else:
+                if result:
+                    self._dead_proxy_failures = 0
+                self._next_probe_at = time.time() + PROXY_HEALTH_INTERVAL_SECONDS
+        except Exception as e:
+            self.log(f"❌ Lỗi khi thăm dò proxy: {e}")
+            self._next_probe_at = time.time() + PROXY_HEALTH_INTERVAL_SECONDS
+        finally:
+            self._probe_running = False
 
     def handle_limit_and_resume(self, reason, session_hint=None, delay_seconds=0):
         with self.lock:
             if self.is_handling:
-                self.log("⏳ Đang trong quá trình reset/resume phiên trước, bỏ qua trigger trùng lặp.")
+                if self.handling_kind == "rotate_only":
+                    self.pending_resume = (reason, session_hint)
+                    self.log(f"⏳ Đang xoay IP nền - sẽ xử lý lỗi '{reason}' ngay khi xoay xong.")
+                else:
+                    self.log("⏳ Đang trong quá trình reset/resume phiên trước, bỏ qua trigger trùng lặp.")
                 return
             self.is_handling = True
+            self.handling_kind = "resume"
+        self._limit_and_resume_body(reason, session_hint, delay_seconds)
 
+    def _limit_and_resume_body(self, reason, session_hint=None, delay_seconds=0, skip_rotation=False):
+        """Thân xử lý lỗi: xoay IP (trừ khi skip_rotation) rồi gửi lệnh tiếp tục.
+        Phải được gọi khi đang giữ cờ is_handling; tự nhả cờ khi xong."""
         try:
             now = time.time()
             # 0. Kiểm tra khóa Global Quota
@@ -319,11 +442,26 @@ class OpenCodeWatchdog:
             self.log(f"🚨 PHÁT HIỆN LỖI/HẠN MỨC TRONG OPENCODE!")
             self.log(f"   Lý do: {reason}")
 
+            # IP vừa được xoay xong mà OpenCode mới báo ngắt kết nối: lỗi thuộc về IP cũ,
+            # không đốt thêm một IP mới nếu IP hiện tại vẫn chạy tốt.
+            if not skip_rotation and "ECONNRESET" in reason and now - self.last_rotation_ok_at < RECENT_ROTATION_SECONDS:
+                skip_rotation = True
+
+            current_ip = None
+            if skip_rotation:
+                current_ip = self.rotator.check_health(timeout=3, quick=True)
+                if current_ip:
+                    self.log(f"ℹ️ IP vừa xoay ({current_ip}) đang hoạt động tốt - không xoay lại, chỉ gửi lệnh tiếp tục.")
+                else:
+                    self.log("⚠️ IP hiện tại không phản hồi - tiến hành xoay IP mới.")
+                    skip_rotation = False
+
             # 1. Đánh dấu IP hiện tại vào blacklist
-            failing_ip = self.rotator.check_health(timeout=3)
-            if failing_ip:
-                self.log(f"🚫 Đánh dấu IP {failing_ip} vào danh sách đã dùng (bị limit: {reason})")
-                self.rotator.mark_ip_used(failing_ip, reason=f"Chặn limit: {reason}")
+            if not skip_rotation:
+                failing_ip = self.rotator.check_health(timeout=3, quick=True)
+                if failing_ip:
+                    self.log(f"🚫 Đánh dấu IP {failing_ip} vào danh sách đã dùng (bị limit: {reason})")
+                    self.rotator.mark_ip_used(failing_ip, reason=f"Chặn limit: {reason}")
 
             # 2. Xác định session ID mục tiêu
             target_session = session_hint
@@ -343,41 +481,45 @@ class OpenCodeWatchdog:
                 self.log("========================================================")
                 return
 
-            # 3. Đợi nếu hệ thống yêu cầu retry delay
-            if delay_seconds > 0:
-                self.log(f"⏳ Cần chờ {delay_seconds}s trước khi reset...")
-                time.sleep(delay_seconds)
+            if skip_rotation:
+                new_ip = current_ip
+            else:
+                # 3. Đợi nếu hệ thống yêu cầu retry delay
+                if delay_seconds > 0:
+                    self.log(f"⏳ Cần chờ {delay_seconds}s trước khi reset...")
+                    time.sleep(delay_seconds)
 
-            # 4. Kích hoạt xoay IP lọc trùng
-            self.rotator.notify("OpenCode Auto-Resume", "Đang tự động đổi IP sạch mới...")
-            success, new_ip, remaining_seconds = self.rotator.rotate(force=True, reason=f"Hết quota trên session {target_session or 'active'}")
+                # 4. Kích hoạt xoay IP lọc trùng
+                self.rotator.notify("OpenCode Auto-Resume", "Đang tự động đổi IP sạch mới...")
+                success, new_ip, remaining_seconds = self.rotator.rotate(force=True, reason=f"Hết quota trên session {target_session or 'active'}")
 
-            if not success or not new_ip:
-                self.log("❌ Không thể kết nối IP mới sau khi xoay. Tạm hoãn gửi prompt.")
-                return
+                if not success or not new_ip:
+                    self.log("❌ Không thể kết nối IP mới sau khi xoay. Tạm hoãn gửi prompt.")
+                    return
 
-            if remaining_seconds and remaining_seconds > 0:
-                self.current_ip_expire_time = time.time() + remaining_seconds
+                self._record_rotation(remaining_seconds)
 
             # 5. Đợi đường truyền ổn định với cơ chế Dynamic Fast Health Probe (tiết kiệm thời gian)
-            self.log(f"⏳ Đã có IP mới ({new_ip}). Đang thăm dò độ ổn định đường truyền...")
-            self.rotator.notify("OpenCode Auto-Resume", f"Đã có IP mới ({new_ip}). Đang kiểm tra kết nối...")
+            #    (bỏ qua khi không xoay: IP hiện tại vừa được thăm dò thành công ở trên)
+            if not skip_rotation:
+                self.log(f"⏳ Đã có IP mới ({new_ip}). Đang thăm dò độ ổn định đường truyền...")
+                self.rotator.notify("OpenCode Auto-Resume", f"Đã có IP mới ({new_ip}). Đang kiểm tra kết nối...")
 
-            time.sleep(5)
-            probe_success = False
-            for probe_i in range(1, 4):
-                probe_ip = self.rotator.check_health(timeout=3)
-                if probe_ip:
-                    self.log(f"⚡ Đường truyền đã thông suốt và ổn định (Thăm dò {probe_i}/3 thành công, IP: {probe_ip})!")
-                    probe_success = True
-                    break
-                self.log(f"   ⏱️ Đường truyền chưa thông, đang đợi thêm 5s (lần {probe_i}/3)...")
                 time.sleep(5)
+                probe_success = False
+                for probe_i in range(1, 4):
+                    probe_ip = self.rotator.check_health(timeout=3, quick=True)
+                    if probe_ip:
+                        self.log(f"⚡ Đường truyền đã thông suốt và ổn định (Thăm dò {probe_i}/3 thành công, IP: {probe_ip})!")
+                        probe_success = True
+                        break
+                    self.log(f"   ⏱️ Đường truyền chưa thông, đang đợi thêm 5s (lần {probe_i}/3)...")
+                    time.sleep(5)
 
-            if not probe_success:
-                fallback_wait = min(15, self.stabilize_wait_seconds)
-                self.log(f"⚠️ Thăm dò chưa có phản hồi ngay, đợi thêm {fallback_wait}s an toàn...")
-                time.sleep(fallback_wait)
+                if not probe_success:
+                    fallback_wait = min(15, self.stabilize_wait_seconds)
+                    self.log(f"⚠️ Thăm dò chưa có phản hồi ngay, đợi thêm {fallback_wait}s an toàn...")
+                    time.sleep(fallback_wait)
 
             # 6. Tự động gửi prompt tiếp tục nếu được bật
             if self.auto_resume and target_session:
@@ -409,6 +551,7 @@ class OpenCodeWatchdog:
         finally:
             with self.lock:
                 self.is_handling = False
+                self.handling_kind = None
 
     def start_monitoring(self):
         """Bắt đầu theo dõi opencode.log theo thời gian thực."""
@@ -425,6 +568,13 @@ class OpenCodeWatchdog:
         # Lỗi hạn mức cũ tìm thấy lúc khởi động: (session_hint, hạn chót) - chỉ xử lý nếu OpenCode mở trong hạn
         pending_startup = None
         ttl_paused = False
+
+        try:
+            self.restore_ip_expiry()
+        except Exception:
+            pass
+        self.log(f"🩺 Proxy Health Monitor: thăm dò proxy mỗi {PROXY_HEALTH_INTERVAL_SECONDS}s khi OpenCode đang mở, "
+                 "proxy chết thì xoay IP ngay.")
 
         try:
             f = open(self.log_file, "r", encoding="utf-8", errors="ignore")
@@ -448,7 +598,8 @@ class OpenCodeWatchdog:
                 pass
 
             f.seek(0, os.SEEK_END)
-            last_trigger_time = 0
+            last_trigger_time = 0  # Chống trigger trùng từ log (riêng, để xoay TTL không nuốt mất lỗi thật)
+            last_ttl_time = 0
             last_pos = f.tell()
 
             while self.running:
@@ -502,12 +653,12 @@ class OpenCodeWatchdog:
                     # Kiểm tra Proactive TTL: Nếu proxy 4G sắp hết hạn sống (còn < 45s)
                     # Chỉ xoay khi OpenCode đang chạy - tắt OpenCode thì tạm dừng, mở lại thì xoay tiếp
                     if self.current_ip_expire_time > 0 and now > (self.current_ip_expire_time - 45):
-                        if (now - last_trigger_time) > 45 and not self.is_handling:
+                        if (now - last_ttl_time) > 45 and not self.is_handling:
                             if self._opencode_running_cached(PRESENCE_CHECK_INTERVAL_SECONDS):
                                 if ttl_paused:
                                     ttl_paused = False
                                     self.log("▶️ OpenCode đã mở lại - tiếp tục xoay IP chủ động.")
-                                last_trigger_time = now
+                                last_ttl_time = now
                                 self.current_ip_expire_time = 0
                                 threading.Thread(
                                     target=self.handle_proactive_ttl,
@@ -516,6 +667,15 @@ class OpenCodeWatchdog:
                             elif not ttl_paused:
                                 ttl_paused = True
                                 self.log("⏸️ OpenCode đã tắt - tạm dừng xoay IP chủ động cho tới khi OpenCode mở lại.")
+
+                    # Proxy Health Monitor: OpenCode đang mở mà proxy chết thì xoay IP ngay
+                    if now >= self._next_probe_at and not self.is_handling and not self._probe_running:
+                        if self._opencode_running_cached(PRESENCE_CHECK_INTERVAL_SECONDS):
+                            self._probe_running = True
+                            threading.Thread(target=self._probe_proxy_health, daemon=True).start()
+                        else:
+                            self._proxy_fail_count = 0
+                            self._next_probe_at = now + PROXY_HEALTH_INTERVAL_SECONDS
 
                     time.sleep(0.4)
                     continue

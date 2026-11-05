@@ -41,7 +41,8 @@
 - 🛡️ **Anti-Duplicate IP Engine (`rotator.py`)**: Lọc bỏ IP trùng lặp trong chu kỳ ngày, tự động dọn dẹp lịch sử IP cũ.
 - ⚡ **Dynamic Fast Probe**: Giảm thời gian chờ đổi IP modem 4G xuống chỉ 5–15s thay vì 25–45s cố định.
 - 🛑 **Smart Circuit Breaker**: Tự động ngắt auto-resume nếu một session bị lỗi 3 lần liên tiếp, chống vòng lặp vô tận làm lãng phí proxy.
-- ⏱️ **Proactive TTL Rotation**: Chủ động đổi IP mới khi proxy 4G sắp hết hạn sống (< 45s) một cách mượt mà và an toàn. Khi OpenCode đã tắt, service nền tự **tạm dừng xoay IP** (không tốn IP, không đổi Device ID) và xoay tiếp khi OpenCode mở lại; Local Bridge vẫn giữ để mở lại OpenCode là dùng được ngay.
+- ⏱️ **Proactive TTL Rotation**: Chủ động đổi IP mới khi proxy 4G sắp hết hạn sống (< 45s) một cách mượt mà và an toàn. Hạn sống của IP được lưu ra `proxy_state.json` nên **khởi động lại tool vẫn nhớ** khi nào IP sắp chết. Khi OpenCode đã tắt, service nền tự **tạm dừng xoay IP** (không tốn IP, không đổi Device ID) và xoay tiếp khi OpenCode mở lại; Local Bridge vẫn giữ để mở lại OpenCode là dùng được ngay.
+- 🩺 **Proxy Health Monitor**: Khi OpenCode đang mở, cứ 20s tool thăm dò proxy một lần. Proxy không phản hồi 2 lần liên tiếp (IP đã chết) thì **xoay IP ngay**, không đợi OpenCode thử lại `Attempt N - retrying` tới lúc bỏ cuộc. Nếu OpenCode bỏ cuộc đúng lúc đang xoay, lệnh tiếp tục vẫn được gửi ngay khi xoay xong. Xoay thất bại liên tục (VD: key API hỏng) thì tự giãn thời gian thử lại (tối đa 10 phút) để không spam API.
 - ⏰ **Đồng Bộ Chu Kỳ Reset Toàn Cầu**: Tự động làm mới danh sách IP theo mốc **00:00:00 UTC (đúng 7:00 AM giờ Việt Nam)** mỗi ngày.
 - 🤖 **Auto-Resume Watchdog (`watchdog.py`)**: Tự động bơm prompt tiếp tục phiên code dang dở ngay khi có mạng mới, loại trừ các lỗi false-positive.
 - 🔑 **Cross-Platform Device Spoofer (`spoofer.py`)**: Tự làm mới Machine UUID / IOPlatformUUID ngẫu nhiên.
@@ -291,6 +292,10 @@ systemctl --user enable --now opencode-unlimited
 
 ### 4. Tôi dùng proxy có mật khẩu (Username / Password) thì cấu hình thế nào?
 > Bạn điền dạng: `"upstream_proxy": "user:pass@host:port"` vào `config.json`.
+
+### 5. OpenCode báo `ECONNRESET: The socket connection was closed unexpectedly` kèm `Attempt N - retrying` là lỗi gì?
+> Đây là lỗi mạng, không phải lỗi code: kết nối tới server AI bị cắt giữa chừng, thường do IP 4G vừa hết hạn sống hoặc modem đang đổi IP. OpenCode tự thử lại, còn **Proxy Health Monitor** sẽ phát hiện proxy chết trong khoảng 30s và xoay IP mới, lần thử tiếp theo của OpenCode sẽ chạy qua IP mới.  
+> 👉 *Nếu số lần thử cứ tăng mãi: mở `opencode_unlimited.log` xem có dòng `key khong ton tai` hoặc `Lỗi gọi API xoay IP` không — nếu có thì key proxy đã hết hạn/sai, cần cập nhật `api_url` trong `config.json`.*
 
 ---
 

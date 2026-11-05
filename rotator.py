@@ -46,6 +46,8 @@ class ProxyRotator:
         self.logger = logger
         self.opencode_dir = get_opencode_dir()
         self.used_ips_file = os.path.join(self.opencode_dir, "used_ips.json")
+        # Lưu IP đang dùng + hạn sống để khởi động lại tool vẫn biết khi nào IP sắp chết
+        self.ip_state_file = os.path.join(self.opencode_dir, "proxy_state.json")
         self.log_file = os.path.join(self.opencode_dir, "log", "proxy-rotate.log")
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
 
@@ -181,10 +183,36 @@ class ProxyRotator:
         self.log("🗑️ Đã xóa sạch danh sách IP đã dùng.")
 
     # ========================================================
+    # TRẠNG THÁI IP HIỆN TẠI (giữ qua các lần khởi động lại)
+    # ========================================================
+
+    def save_ip_state(self, ip, expire_at):
+        try:
+            with open(self.ip_state_file, "w", encoding="utf-8") as f:
+                json.dump({"ip": ip, "expire_at": expire_at, "saved_at": time.time()}, f, indent=2)
+        except Exception:
+            pass
+
+    def load_ip_state(self):
+        try:
+            with open(self.ip_state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    # ========================================================
     # HEALTH CHECK & XOAY IP
     # ========================================================
 
-    def check_health(self, timeout=5):
+    def check_health(self, timeout=5, quick=False):
+        """Trả về IP public đang đi qua proxy, hoặc None nếu proxy không phản hồi.
+
+        quick=True: chỉ thử 3 endpoint qua Local Bridge (đúng đường OpenCode đang dùng), không
+        fallback sang upstream. Khi proxy treo, bản đầy đủ mất tới 8 x timeout (~24s với
+        timeout=3), bản quick tối đa 3 x timeout."""
         endpoints = [
             "http://api.ipify.org",
             "http://icanhazip.com",
@@ -192,11 +220,12 @@ class ProxyRotator:
             "https://icanhazip.com",
             "http://ifconfig.me/ip"
         ]
+        bridge_endpoints = ["http://api.ipify.org", "http://icanhazip.com", "http://ifconfig.me/ip"] if quick else endpoints
         proxy_url = f"http://127.0.0.1:{self.local_port}"
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
         )
-        for ep in endpoints:
+        for ep in bridge_endpoints:
             try:
                 req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
                 with opener.open(req, timeout=timeout) as resp:
@@ -206,6 +235,9 @@ class ProxyRotator:
                             return ip
             except Exception:
                 pass
+
+        if quick:
+            return None
 
         # Fallback thử qua trực tiếp upstream
         clean_upstream = self.upstream_proxy
@@ -232,11 +264,13 @@ class ProxyRotator:
 
     def rotate(self, force=False, reason="Yêu cầu xoay IP"):
         self.log("========================================================")
-        old_ip = self.check_health(timeout=3)
+        old_ip = self.check_health(timeout=3, quick=True)
         self.log(f"🔄 Bắt đầu xoay IP tự động [Lý do: {reason}] (IP cũ: {old_ip or 'Chưa xác định'})...")
 
         remaining_seconds = 1200
+        ttl_measured_at = None  # Thời điểm API báo hạn sống, để tính hạn chính xác (không cộng dồn thời gian thăm dò)
         chosen_ip = None
+        new_ip = None
 
         for dedup_attempt in range(1, self.max_dedup_attempts + 1):
             if dedup_attempt > 1:
@@ -281,6 +315,7 @@ class ProxyRotator:
                         match = re.search(r"die sau (\d+)s", msg)
                         if match:
                             remaining_seconds = int(match.group(1))
+                            ttl_measured_at = time.time()
                             self.log(f"⏱️ Thời hạn sống của IP: {remaining_seconds}s (~{remaining_seconds/60:.1f} phút)")
                         break
                 except Exception as e:
@@ -295,7 +330,7 @@ class ProxyRotator:
             new_ip = None
             max_probes = 15
             for attempt in range(1, max_probes + 1):
-                probed_ip = self.check_health(timeout=3)
+                probed_ip = self.check_health(timeout=3, quick=True)
                 if probed_ip:
                     # Nếu modem vẫn đang giữ IP cũ thì tiếp tục đợi
                     if old_ip and probed_ip == old_ip and attempt < 8:
@@ -335,6 +370,12 @@ class ProxyRotator:
         new_uuid = generate_new_device_id()
 
         if chosen_ip:
+            if ttl_measured_at:
+                expire_at = ttl_measured_at + remaining_seconds
+                remaining_seconds = max(0, int(expire_at - time.time()))
+            else:
+                expire_at = time.time() + remaining_seconds
+            self.save_ip_state(chosen_ip, expire_at)
             self.log(f"✅ HOÀN TẤT XOAY IP! IP hiện tại: {chosen_ip} | Device ID: {new_uuid}")
             self.notify("Proxy Xoay Thành Công", f"Đã kết nối IP mới: {chosen_ip}")
             self.log("========================================================")
