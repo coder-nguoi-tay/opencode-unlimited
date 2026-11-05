@@ -1,17 +1,21 @@
-# Stop OpenCode Unlimited running background instances
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
+﻿# Stop OpenCode Unlimited running background instances
+# Lưu ý: param() bắt buộc phải là câu lệnh đầu tiên của script.
 param (
     [switch]$StopOpenCode
 )
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host " 🛑 DỪNG CÁC TIẾN TRÌNH CHẠY NGẦM OPENCODE UNLIMITED" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
 
 $stopped = 0
-Get-CimInstance Win32_Process | Where-Object { 
-    ($_.CommandLine -like "*main.py*" -or $_.CommandLine -like "*bridge.py*") -and ($_.CommandLine -notlike "*stop-background.ps1*")
+# Chỉ nhắm vào tiến trình Python (python/pythonw/py) chạy main.py hoặc bridge.py,
+# tránh tắt nhầm editor hay chương trình khác có "main.py" trong command line.
+Get-CimInstance Win32_Process | Where-Object {
+    ($_.Name -match '^(python|pythonw|py)(\d+(\.\d+)*)?\.exe$') -and
+    ($_.CommandLine -match '(^|[\\/\s"])(main|bridge)\.py\b')
 } | ForEach-Object {
     Write-Host "🛑 Đang tắt tiến trình: $($_.ProcessId) ($($_.Name))" -ForegroundColor Yellow
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue

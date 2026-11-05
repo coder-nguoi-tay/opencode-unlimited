@@ -8,3 +8,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Cấu hình cá nhân (chứa API key) — dùng config.example.json làm mẫu
+config.json
