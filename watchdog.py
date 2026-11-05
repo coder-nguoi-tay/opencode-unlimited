@@ -22,6 +22,7 @@ import subprocess
 import platform
 import shutil
 import glob
+import csv
 
 # Fix mã hóa Unicode tiếng Việt trên Windows Console
 if sys.platform == "win32":
@@ -49,6 +50,69 @@ PROXY_HEALTH_RETRY_SECONDS = 5         # Thăm dò lại nhanh sau một lần l
 PROXY_DEAD_THRESHOLD = 2               # Số lần lỗi liên tiếp để coi proxy đã chết
 PROXY_DEAD_BACKOFF_MAX_SECONDS = 600   # Xoay IP thất bại liên tục (VD: key API hỏng) thì giãn dần, tối đa 10 phút
 RECENT_ROTATION_SECONDS = 120          # ECONNRESET tới trong khoảng này sau khi vừa xoay xong là lỗi của IP cũ
+
+
+def _command_args(cmdline):
+    """Các tham số đứng sau đường dẫn file thực thi (đường dẫn có thể nằm trong ngoặc kép), viết thường."""
+    s = (cmdline or "").strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        rest = s[end + 1:] if end != -1 else ""
+    else:
+        parts = s.split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+    return [a.strip('"').lower() for a in rest.split()]
+
+
+def is_background_opencode_process(cmdline):
+    """True nếu tiến trình OpenCode này chạy ngầm, không có nghĩa là người dùng đang mở OpenCode:
+    - "serve --service": backend mà OpenCode Desktop để lại chạy ngầm sau khi đóng cửa sổ
+    - "api ...": lệnh ngắn do chính watchdog gọi (hỏi session, gửi lệnh tiếp tục)"""
+    args = _command_args(cmdline)
+    subcommand = next((a for a in args if not a.startswith("-")), None)
+    if subcommand == "api":
+        return True
+    return subcommand == "serve" and "--service" in args
+
+
+def _windows_command_lines(pids):
+    """{pid: command line} của các PID còn sống ("" nếu không đọc được, VD: tiến trình chạy quyền admin)."""
+    flt = " OR ".join(f"ProcessId={int(p)}" for p in pids)
+    ps_cmd = (
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+        f"Get-CimInstance Win32_Process -Filter '{flt}' | "
+        "ForEach-Object { [string]$_.ProcessId + [char]9 + [string]$_.CommandLine }"
+    )
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+        capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"Get-CimInstance lỗi (exit {res.returncode})")
+    out = {}
+    for line in res.stdout.splitlines():
+        pid, _, cmd = line.partition("\t")
+        if pid.strip().isdigit():
+            out[int(pid)] = cmd.strip()
+    return out
+
+
+def _posix_command_lines(pids):
+    """{pid: command line} của các PID còn sống."""
+    res = subprocess.run(
+        ["ps", "-o", "pid=", "-o", "args=", "-p", ",".join(str(int(p)) for p in pids)],
+        capture_output=True, text=True, errors="ignore", timeout=10,
+    )
+    if res.returncode not in (0, 1):  # 1 = không còn PID nào
+        raise RuntimeError(f"ps lỗi (exit {res.returncode})")
+    out = {}
+    for line in res.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid.isdigit():
+            out[int(pid)] = cmd.strip()
+    return out
+
 
 class OpenCodeWatchdog:
     def __init__(self, rotator, stabilize_wait_seconds=60, auto_resume=True,
@@ -81,9 +145,12 @@ class OpenCodeWatchdog:
         self.global_limit_locked_until = 0
         self._presence_checked_at = None
         self._presence_cache = True
+        self._background_pids = {}            # pid -> True nếu là tiến trình nền (command line không đổi theo PID)
 
     def is_opencode_running(self):
-        """Kiểm tra OpenCode (Desktop hoặc CLI) có đang chạy không.
+        """Kiểm tra người dùng có đang mở OpenCode (cửa sổ Desktop hoặc CLI) không.
+        Bỏ qua tiến trình chạy ngầm (xem is_background_opencode_process): đóng cửa sổ Desktop thì
+        backend "opencode-cli serve --service" vẫn còn nhưng OpenCode coi như đã tắt.
         Nếu không kiểm tra được thì trả về True để giữ hành vi cũ (không chặn xoay IP)."""
         try:
             if platform.system() == "Windows":
@@ -96,25 +163,48 @@ class OpenCodeWatchdog:
                 if res.returncode != 0:
                     return True
                 targets = {f"{n}.exe" for n in OPENCODE_PROCESS_NAMES}
-                for line in res.stdout.splitlines():
-                    image = line.split(",", 1)[0].strip().strip('"').lower()
-                    if image in targets:
-                        return True
-                return False
+                pids = set()
+                for row in csv.reader(res.stdout.splitlines()):
+                    if len(row) >= 2 and row[0].strip().lower() in targets and row[1].strip().isdigit():
+                        pids.add(int(row[1]))
+                return self._has_foreground_opencode(pids, _windows_command_lines)
 
             pattern = "|".join(OPENCODE_PROCESS_NAMES)
-            res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, timeout=10)
-            if res.returncode in (0, 1):  # 0 = có tiến trình, 1 = không có
-                return res.returncode == 0
-            return True
+            res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, text=True, timeout=10)
+            if res.returncode == 1:  # 1 = không có tiến trình
+                return False
+            if res.returncode != 0:
+                return True
+            pids = {int(p) for p in res.stdout.split() if p.isdigit()}
+            return self._has_foreground_opencode(pids, _posix_command_lines)
         except Exception:
             return True
 
+    def _has_foreground_opencode(self, pids, fetch_command_lines):
+        """Có PID nào trong số này không phải tiến trình nền không. Chỉ đọc command line của PID mới gặp."""
+        self._background_pids = {p: bg for p, bg in self._background_pids.items() if p in pids}
+        unknown = [p for p in pids if p not in self._background_pids]
+        if unknown:
+            cmdlines = fetch_command_lines(unknown)
+            for pid in unknown:
+                if pid in cmdlines:  # PID không có trong kết quả = đã thoát
+                    # Không đọc được command line thì coi như OpenCode đang mở (an toàn như hành vi cũ)
+                    cmd = cmdlines[pid]
+                    self._background_pids[pid] = bool(cmd) and is_background_opencode_process(cmd)
+        return any(self._background_pids.get(p) is False for p in pids)
+
     def _opencode_running_cached(self, max_age):
-        """Như is_opencode_running() nhưng chỉ kiểm tra lại sau mỗi max_age giây."""
+        """Như is_opencode_running() nhưng chỉ kiểm tra lại sau mỗi max_age giây. Ghi log khi OpenCode đóng/mở."""
         now = time.time()
         if self._presence_checked_at is None or now - self._presence_checked_at >= max_age:
-            self._presence_cache = self.is_opencode_running()
+            running = self.is_opencode_running()
+            if running != self._presence_cache:
+                if running:
+                    self.log("▶️ OpenCode đã mở lại - tiếp tục thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục.")
+                else:
+                    self.log("⏸️ OpenCode đã đóng - tạm dừng thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục "
+                             "cho tới khi OpenCode mở lại (Local Bridge vẫn chạy).")
+            self._presence_cache = running
             self._presence_checked_at = now
         return self._presence_cache
 
@@ -567,7 +657,6 @@ class OpenCodeWatchdog:
 
         # Lỗi hạn mức cũ tìm thấy lúc khởi động: (session_hint, hạn chót) - chỉ xử lý nếu OpenCode mở trong hạn
         pending_startup = None
-        ttl_paused = False
 
         try:
             self.restore_ip_expiry()
@@ -655,18 +744,12 @@ class OpenCodeWatchdog:
                     if self.current_ip_expire_time > 0 and now > (self.current_ip_expire_time - 45):
                         if (now - last_ttl_time) > 45 and not self.is_handling:
                             if self._opencode_running_cached(PRESENCE_CHECK_INTERVAL_SECONDS):
-                                if ttl_paused:
-                                    ttl_paused = False
-                                    self.log("▶️ OpenCode đã mở lại - tiếp tục xoay IP chủ động.")
                                 last_ttl_time = now
                                 self.current_ip_expire_time = 0
                                 threading.Thread(
                                     target=self.handle_proactive_ttl,
                                     daemon=True
                                 ).start()
-                            elif not ttl_paused:
-                                ttl_paused = True
-                                self.log("⏸️ OpenCode đã tắt - tạm dừng xoay IP chủ động cho tới khi OpenCode mở lại.")
 
                     # Proxy Health Monitor: OpenCode đang mở mà proxy chết thì xoay IP ngay
                     if now >= self._next_probe_at and not self.is_handling and not self._probe_running:
@@ -731,6 +814,11 @@ class OpenCodeWatchdog:
                     if now - last_trigger_time < 25:
                         continue
                     last_trigger_time = now
+
+                    # Đã đóng OpenCode (phiên chỉ còn chạy trong backend ngầm): không đốt IP, không tự gửi lệnh tiếp tục
+                    if not self._opencode_running_cached(0):
+                        self.log(f"ℹ️ OpenCode đang đóng - bỏ qua lỗi '{reason}': không xoay IP, không gửi lệnh tiếp tục.")
+                        continue
 
                     session_hint = None
                     m1 = re.search(r"(?:sessionID|sessionId|session\.id)=([a-zA-Z0-9_-]+)", line)
