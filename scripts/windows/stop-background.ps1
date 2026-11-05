@@ -1,5 +1,9 @@
-﻿# Stop OpenCode Unlimited running background instances
+# Stop OpenCode Unlimited running background instances
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+param (
+    [switch]$StopOpenCode
+)
 
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host " 🛑 DỪNG CÁC TIẾN TRÌNH CHẠY NGẦM OPENCODE UNLIMITED" -ForegroundColor Cyan
@@ -7,7 +11,7 @@ Write-Host "========================================================" -Foregroun
 
 $stopped = 0
 Get-CimInstance Win32_Process | Where-Object { 
-    $_.CommandLine -like "*main.py*" -or $_.CommandLine -like "*bridge.py*"
+    ($_.CommandLine -like "*main.py*" -or $_.CommandLine -like "*bridge.py*") -and ($_.CommandLine -notlike "*stop-background.ps1*")
 } | ForEach-Object {
     Write-Host "🛑 Đang tắt tiến trình: $($_.ProcessId) ($($_.Name))" -ForegroundColor Yellow
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -22,6 +26,14 @@ try {
         Write-Host "🌐 Đã khôi phục Windows System Proxy về tắt." -ForegroundColor Green
     }
 } catch {}
+
+if ($StopOpenCode) {
+    Get-Process -Name "opencode-cli", "OpenCode" -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "🛑 Đang dừng OpenCode: $($_.Id) ($($_.ProcessName))" -ForegroundColor Yellow
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        $stopped++
+    }
+}
 
 if ($stopped -gt 0) {
     Write-Host "✅ Đã dừng thành công $stopped tiến trình." -ForegroundColor Green

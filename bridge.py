@@ -29,16 +29,46 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 class ProxyBridge:
-    def __init__(self, upstream_host, upstream_port, local_host="127.0.0.1", local_port=28080, logger=None):
+    def __init__(self, upstream_host, upstream_port, local_host="127.0.0.1", local_port=28080, upstream_auth=None, logger=None):
         self.upstream_host = upstream_host
         self.upstream_port = int(upstream_port)
         self.local_host = local_host
         self.local_port = int(local_port)
+        self.upstream_auth = upstream_auth
         self.logger = logger or logging.getLogger("ProxyBridge")
         self.server = None
         self.loop = None
         self.thread = None
         self.running = False
+
+    async def _pipe_client_to_remote(self, reader, writer):
+        try:
+            first_chunk = True
+            while self.running and not reader.at_eof():
+                data = await asyncio.wait_for(reader.read(16384), timeout=90.0)
+                if not data:
+                    break
+                if first_chunk and self.upstream_auth:
+                    first_chunk = False
+                    # Nếu là CONNECT hoặc HTTP request, inject Proxy-Authorization
+                    if data.startswith(b"CONNECT ") or data.startswith(b"GET ") or data.startswith(b"POST "):
+                        import base64
+                        auth_str = f"Proxy-Authorization: Basic {base64.b64encode(self.upstream_auth.encode()).decode()}\r\n".encode()
+                        if b"\r\n\r\n" in data:
+                            header_part, rest = data.split(b"\r\n\r\n", 1)
+                            data = header_part + b"\r\n" + auth_str + b"\r\n" + rest
+                writer.write(data)
+                await writer.drain()
+        except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _pipe(self, reader, writer):
         try:
@@ -77,7 +107,7 @@ class ProxyBridge:
             return
 
         await asyncio.gather(
-            self._pipe(client_reader, remote_writer),
+            self._pipe_client_to_remote(client_reader, remote_writer),
             self._pipe(remote_reader, client_writer),
             return_exceptions=True
         )

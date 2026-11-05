@@ -37,10 +37,13 @@
 ## ✨ Tính Năng Nổi Bật
 
 - ⚡ **Chạy Đúng 1 Lệnh (All-in-One)**: Hoạt động ngay tức thì trên cả **macOS**, **Linux** và **Windows**.
-- 🔌 **Local Proxy Bridge Thuần Python (`bridge.py`)**: Lắng nghe tại `127.0.0.1:28080` và chuyển tiếp trực tiếp sang Upstream Proxy bằng `asyncio`.
-- 🛡️ **Anti-Duplicate IP Engine (`rotator.py`)**: Lọc bỏ IP trùng lặp trong chu kỳ ngày.
+- 🔌 **Local Proxy Bridge Thuần Python (`bridge.py`)**: Lắng nghe tại `127.0.0.1:28080`, chuyển tiếp trực tiếp sang Upstream Proxy bằng `asyncio`, hỗ trợ cả proxy có xác thực (`user:pass@host:port`).
+- 🛡️ **Anti-Duplicate IP Engine (`rotator.py`)**: Lọc bỏ IP trùng lặp trong chu kỳ ngày, tự động dọn dẹp lịch sử IP cũ.
+- ⚡ **Dynamic Fast Probe**: Giảm thời gian chờ đổi IP modem 4G xuống chỉ 5–15s thay vì 25–45s cố định.
+- 🛑 **Smart Circuit Breaker**: Tự động ngắt auto-resume nếu một session bị lỗi 3 lần liên tiếp, chống vòng lặp vô tận làm lãng phí proxy.
+- ⏱️ **Proactive TTL Rotation**: Chủ động đổi IP mới khi proxy 4G sắp hết hạn sống (< 45s) một cách mượt mà và an toàn.
 - ⏰ **Đồng Bộ Chu Kỳ Reset Toàn Cầu**: Tự động làm mới danh sách IP theo mốc **00:00:00 UTC (đúng 7:00 AM giờ Việt Nam)** mỗi ngày.
-- 🤖 **Auto-Resume Watchdog (`watchdog.py`)**: Tự động bơm prompt tiếp tục phiên code dang dở ngay khi có mạng mới.
+- 🤖 **Auto-Resume Watchdog (`watchdog.py`)**: Tự động bơm prompt tiếp tục phiên code dang dở ngay khi có mạng mới, loại trừ các lỗi false-positive.
 - 🔑 **Cross-Platform Device Spoofer (`spoofer.py`)**: Tự làm mới Machine UUID / IOPlatformUUID ngẫu nhiên.
 
 ---
@@ -145,6 +148,9 @@ Bạn cũng có thể mở trực tiếp file `config.json` để chỉnh sửa 
 Bạn có thể chạy các lệnh quản trị này bất kỳ lúc nào:
 
 ```bash
+# 0. Xem bảng trạng thái hệ thống toàn diện (Proxy, IP hiện tại, Session, Tiến trình)
+opencode-unlimited --status
+
 # 1. Xem danh sách tất cả các IP đã dùng trong ngày hôm nay
 opencode-unlimited --list-ips
 
@@ -157,6 +163,11 @@ opencode-unlimited --rotate
 # 4. Khởi động Proxy ngầm và tự động bật luôn OpenCode CLI
 opencode-unlimited --launch
 ```
+
+> **Mẹo trên Windows**: Trong thư mục `scripts\windows\`:
+> - Chạy ngầm không cửa sổ: Chạy `start-background.vbs`
+> - Xem trạng thái nhanh: Chạy `powershell -File scripts\windows\status.ps1`
+> - Dừng hệ thống: Chạy `powershell -File scripts\windows\stop-background.ps1` (hoặc thêm `-StopOpenCode` để tắt cả OpenCode)
 
 ---
 

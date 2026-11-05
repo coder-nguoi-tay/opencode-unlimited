@@ -32,6 +32,10 @@ if sys.platform == "win32":
 
 from spoofer import get_opencode_dir
 
+MAX_CONSECUTIVE_SESSION_RETRIES = 3
+MAX_CONSECUTIVE_GLOBAL_LIMITS = 3
+GLOBAL_LIMIT_COOLDOWN_SECONDS = 900  # 15 phút nếu dính hạn mức toàn cầu
+
 class OpenCodeWatchdog:
     def __init__(self, rotator, stabilize_wait_seconds=60, auto_resume=True,
                  prompt_resume_text="Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở."):
@@ -50,6 +54,10 @@ class OpenCodeWatchdog:
         self.is_handling = False
         self.running = False
         self.current_ip_expire_time = 0
+        self.session_retries = {}             # session_id -> int
+        self.circuit_broken_sessions = set()  # Các session bị khóa auto-resume để chống lặp vô tận
+        self.consecutive_global_limits = 0
+        self.global_limit_locked_until = 0
 
     def _find_opencode_binary(self):
         """Tìm đường dẫn binary thực thi của OpenCode trên hệ thống."""
@@ -142,8 +150,10 @@ class OpenCodeWatchdog:
             pass
         return []
 
-    def get_latest_session_id(self):
-        """Lấy session ID gần nhất từ database SQLite của OpenCode (mở chế độ read-only an toàn)."""
+    def get_latest_session_id(self, max_idle_seconds=900):
+        """Lấy session ID gần nhất từ database SQLite của OpenCode (mở chế độ read-only an toàn).
+        Chỉ trả về session nếu vừa được cập nhật trong max_idle_seconds (mặc định 15 phút)
+        và chưa hoàn tất thành công (không resume session đã xong)."""
         if not os.path.exists(self.db_file):
             return None
         conn = None
@@ -158,7 +168,16 @@ class OpenCodeWatchdog:
             cursor = conn.cursor()
             # Thử bảng session_v2 (OpenCode hiện đại)
             try:
-                cursor.execute("SELECT id FROM session_v2 ORDER BY time_updated DESC LIMIT 1;")
+                now_ms = int(time.time() * 1000)
+                min_time_updated = now_ms - (max_idle_seconds * 1000)
+                cursor.execute("""
+                    SELECT id FROM session_v2 
+                    WHERE time_archived IS NULL 
+                      AND (idle_outcome IS NULL OR idle_outcome != 'completed')
+                      AND time_updated >= ?
+                    ORDER BY time_updated DESC 
+                    LIMIT 1;
+                """, (min_time_updated,))
                 row = cursor.fetchone()
                 if row:
                     return row[0]
@@ -167,7 +186,7 @@ class OpenCodeWatchdog:
 
             # Fallback bảng session cũ nếu có
             try:
-                cursor.execute("SELECT id FROM session ORDER BY updated_at DESC LIMIT 1;")
+                cursor.execute("SELECT id FROM session WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT 1;", (time.time() - max_idle_seconds,))
                 row = cursor.fetchone()
                 if row:
                     return row[0]
@@ -209,6 +228,34 @@ class OpenCodeWatchdog:
             self.log(f"⚠️ Ngoại lệ khi gửi lệnh tiếp tục: {e}")
             return False, str(e)
 
+    def handle_proactive_ttl(self):
+        """Chủ động xoay IP khi proxy 4G sắp hết hạn sống (TTL).
+        LƯU Ý: Chỉ xoay IP nền và cập nhật bộ đếm thời gian, tuyệt đối không
+        tự ý bơm prompt resume vào các session đang rảnh hoặc đã kết thúc."""
+        with self.lock:
+            if self.is_handling:
+                return
+            self.is_handling = True
+
+        try:
+            self.log("========================================================")
+            self.log("⏱️ [PROACTIVE TTL] Proxy 4G sắp hết hạn sống (< 45s). Đang chủ động xoay IP mới...")
+            self.rotator.notify("OpenCode Proactive TTL", "Đang chủ động đổi IP sạch mới trước khi proxy hết hạn...")
+            success, new_ip, remaining_seconds = self.rotator.rotate(force=True, reason="Chủ động xoay IP (Proactive TTL)")
+
+            if success and new_ip:
+                if remaining_seconds and remaining_seconds > 0:
+                    self.current_ip_expire_time = time.time() + remaining_seconds
+                self.log(f"✅ Đã chủ động cập nhật IP mới ({new_ip}) thành công! Mọi kết nối sẽ tự động định tuyến qua IP mới.")
+            else:
+                self.log("⚠️ Không thể đổi IP proactive mới, sẽ thử lại ở chu kỳ tiếp theo.")
+            self.log("========================================================")
+        except Exception as e:
+            self.log(f"❌ Lỗi trong Proactive TTL: {e}")
+        finally:
+            with self.lock:
+                self.is_handling = False
+
     def handle_limit_and_resume(self, reason, session_hint=None, delay_seconds=0):
         with self.lock:
             if self.is_handling:
@@ -217,12 +264,19 @@ class OpenCodeWatchdog:
             self.is_handling = True
 
         try:
+            now = time.time()
+            # 0. Kiểm tra khóa Global Quota
+            if now < self.global_limit_locked_until:
+                wait_min = max(1, int((self.global_limit_locked_until - now) / 60))
+                self.log(f"🛑 [GLOBAL QUOTA LOCK] Toàn bộ IP đều dính hạn mức toàn cầu của OpenCode. Đang tạm ngưng xoay IP trong {wait_min} phút nữa.")
+                return
+
             self.log("========================================================")
             self.log(f"🚨 PHÁT HIỆN LỖI/HẠN MỨC TRONG OPENCODE!")
             self.log(f"   Lý do: {reason}")
 
             # 1. Đánh dấu IP hiện tại vào blacklist
-            failing_ip = self.rotator.check_health()
+            failing_ip = self.rotator.check_health(timeout=3)
             if failing_ip:
                 self.log(f"🚫 Đánh dấu IP {failing_ip} vào danh sách đã dùng (bị limit: {reason})")
                 self.rotator.mark_ip_used(failing_ip, reason=f"Chặn limit: {reason}")
@@ -234,9 +288,16 @@ class OpenCodeWatchdog:
                 if active_list:
                     target_session = active_list[0]
             if not target_session:
-                target_session = self.get_latest_session_id()
+                target_session = self.get_latest_session_id(max_idle_seconds=900)
 
             self.log(f"   Target Session: {target_session or 'Chưa xác định'}")
+
+            # Kiểm tra Circuit Breaker đối với session này
+            if target_session and target_session in self.circuit_broken_sessions:
+                self.log(f"⛔ [CIRCUIT BREAKER] Phiên {target_session} đang bị tạm khóa auto-resume do lỗi liên tiếp {MAX_CONSECUTIVE_SESSION_RETRIES} lần.")
+                self.log("   Bỏ qua trigger tự động để tránh lặp vô tận và tiết kiệm proxy.")
+                self.log("========================================================")
+                return
 
             # 3. Đợi nếu hệ thống yêu cầu retry delay
             if delay_seconds > 0:
@@ -258,17 +319,16 @@ class OpenCodeWatchdog:
             self.log(f"⏳ Đã có IP mới ({new_ip}). Đang thăm dò độ ổn định đường truyền...")
             self.rotator.notify("OpenCode Auto-Resume", f"Đã có IP mới ({new_ip}). Đang kiểm tra kết nối...")
 
-            # Đợi tối thiểu 10s để modem/trạm phát 4G hoàn tất định tuyến
-            time.sleep(10)
+            time.sleep(5)
             probe_success = False
             for probe_i in range(1, 4):
-                probe_ip = self.rotator.check_health()
+                probe_ip = self.rotator.check_health(timeout=3)
                 if probe_ip:
                     self.log(f"⚡ Đường truyền đã thông suốt và ổn định (Thăm dò {probe_i}/3 thành công, IP: {probe_ip})!")
                     probe_success = True
                     break
-                self.log(f"   ⏱️ Đường truyền chưa thông, đang đợi thêm 10s (lần {probe_i}/3)...")
-                time.sleep(10)
+                self.log(f"   ⏱️ Đường truyền chưa thông, đang đợi thêm 5s (lần {probe_i}/3)...")
+                time.sleep(5)
 
             if not probe_success:
                 fallback_wait = min(15, self.stabilize_wait_seconds)
@@ -277,15 +337,27 @@ class OpenCodeWatchdog:
 
             # 6. Tự động gửi prompt tiếp tục nếu được bật
             if self.auto_resume and target_session:
-                self.log(f"🚀 Hết thời gian chờ! Tự động gửi lệnh tiếp tục phiên {target_session}...")
-                ok, _ = self.send_resume_prompt(target_session)
-                if ok:
-                    self.rotator.notify("OpenCode Auto-Resume", f"Đã tự động tiếp tục code phiên {target_session[:12]}...")
+                cur_retries = self.session_retries.get(target_session, 0) + 1
+                self.session_retries[target_session] = cur_retries
+
+                if cur_retries >= MAX_CONSECUTIVE_SESSION_RETRIES:
+                    self.circuit_broken_sessions.add(target_session)
+                    self.log(f"⛔ [CIRCUIT BREAKER KÍCH HOẠT] Phiên {target_session} đã thử auto-resume {cur_retries} lần liên tiếp.")
+                    self.log(f"   Tạm dừng auto-resume cho phiên này để chống vòng lặp vô tận. Vui lòng kiểm tra lại task.")
+                    self.rotator.notify(
+                        "OpenCode Circuit Breaker",
+                        f"Tạm dừng auto-resume phiên {target_session[:8]} do lỗi 3 lần liên tiếp."
+                    )
                 else:
-                    time.sleep(5)
-                    self.send_resume_prompt(target_session)
+                    self.log(f"🚀 Hết thời gian chờ! Tự động gửi lệnh tiếp tục phiên {target_session} (Thử lần {cur_retries}/{MAX_CONSECUTIVE_SESSION_RETRIES})...")
+                    ok, _ = self.send_resume_prompt(target_session)
+                    if ok:
+                        self.rotator.notify("OpenCode Auto-Resume", f"Đã tự động tiếp tục code phiên {target_session[:12]}...")
+                    else:
+                        time.sleep(4)
+                        self.send_resume_prompt(target_session)
             elif not target_session:
-                self.log("⚠️ Không tìm thấy session nào để tự động resume.")
+                self.log("ℹ️ Không có session nào cần resume. Proxy đã sẵn sàng.")
 
             self.log("========================================================")
         except Exception as e:
@@ -367,24 +439,33 @@ class OpenCodeWatchdog:
                         pass
                     last_pos = f.tell()
 
-                    # Kiểm tra Proactive TTL: Nếu proxy 4G sắp hết hạn sống (còn < 45s) và OpenCode đang nhàn rỗi
+                    # Kiểm tra Proactive TTL: Nếu proxy 4G sắp hết hạn sống (còn < 45s)
                     now = time.time()
                     if self.current_ip_expire_time > 0 and now > (self.current_ip_expire_time - 45):
                         if (now - last_trigger_time) > 45 and not self.is_handling:
-                            self.log("⏱️ Proxy 4G sắp hết hạn sống (còn < 45s). Đang chủ động xoay IP trước để tránh gián đoạn...")
                             last_trigger_time = now
                             self.current_ip_expire_time = 0
-                            t = threading.Thread(
-                                target=self.handle_limit_and_resume,
-                                args=("Chủ động xoay IP trước khi proxy hết hạn (Proactive TTL)", None, 0),
+                            threading.Thread(
+                                target=self.handle_proactive_ttl,
                                 daemon=True
-                            )
-                            t.start()
+                            ).start()
 
                     time.sleep(0.4)
                     continue
 
                 line_lower = line.lower()
+
+                # Bỏ qua các log hệ thống định kỳ không liên quan đến phiên code của người dùng
+                if any(ign in line_lower for ign in [
+                    "failed to fetch models.dev",
+                    "models.opencode.ai",
+                    "api.github.com",
+                    "cli starting",
+                    "telemetry",
+                    "analytics"
+                ]):
+                    continue
+
                 is_trigger = False
                 reason = ""
 
@@ -413,8 +494,10 @@ class OpenCodeWatchdog:
                     is_trigger = True
                     reason = "HTTP 503 Service Unavailable"
                 elif "econnreset" in line_lower or "socket connection was closed unexpectedly" in line_lower:
-                    is_trigger = True
-                    reason = "ECONNRESET / Socket Reset"
+                    # Chỉ trigger nếu lỗi ngắt kết nối xảy ra trong một phiên làm việc thực tế
+                    if "session" in line_lower or "sessionid=" in line_lower or "failed to drain" in line_lower:
+                        is_trigger = True
+                        reason = "ECONNRESET / Socket Reset (trong phiên làm việc)"
 
                 if is_trigger:
                     now = time.time()

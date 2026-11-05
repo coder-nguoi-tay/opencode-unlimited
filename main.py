@@ -42,19 +42,26 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 CONFIG_EXAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.example.json")
 
 def parse_proxy_host_port(upstream_str):
-    """Tách Host và Port từ chuỗi proxy (hỗ trợ IP:PORT, user:pass@IP:PORT, IP:PORT:user:pass, http://...)."""
+    """Tách Host, Port và Auth từ chuỗi proxy (hỗ trợ IP:PORT, user:pass@IP:PORT, IP:PORT:user:pass, http://...)."""
     s = str(upstream_str).strip()
+    auth = None
     if "://" in s:
         s = s.split("://", 1)[1]
     if "@" in s:
-        s = s.split("@", 1)[1]
+        auth_part, s = s.split("@", 1)
+        auth = auth_part.strip()
     parts = s.split(":")
-    if len(parts) >= 2:
+    if len(parts) == 4:
+        host = parts[0].strip()
+        port_str = parts[1].strip()
+        auth = f"{parts[2].strip()}:{parts[3].strip()}"
+        return host, int(port_str) if port_str.isdigit() else 8080, auth
+    elif len(parts) >= 2:
         host = parts[0].strip()
         port_str = parts[1].strip()
         if port_str.isdigit():
-            return host, int(port_str)
-    return s, 8080
+            return host, int(port_str), auth
+    return s, 8080, auth
 
 def set_windows_system_proxy(enable=True, proxy_server="127.0.0.1:28080"):
     """Tùy chọn thiết lập System Proxy trên Windows (HKCU không cần quyền Admin)."""
@@ -147,8 +154,85 @@ def print_banner(cfg, public_ip=None):
     print(f" 🎯 Trạng thái mạng:    {public_ip or 'Đang kiểm tra kết nối...'}")
     print("================================================================================\n")
 
+def show_status_dashboard(cfg):
+    """Hiển thị bảng trạng thái hệ thống toàn diện."""
+    import socket
+    local_port = cfg.get("local_port", 28080)
+    
+    # 1. Kiểm tra Port 28080 có đang mở không
+    bridge_running = False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1.0)
+    try:
+        sock.connect(("127.0.0.1", local_port))
+        sock.close()
+        bridge_running = True
+    except Exception:
+        pass
+
+    # 2. Tìm tiến trình nền đang chạy
+    bg_pids = []
+    if platform.system() == "Windows":
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | Where-Object { ($_.Name -match 'python') -and ($_.CommandLine -match 'main\\.py') -and ($_.CommandLine -notmatch '--status') } | Select-Object -ExpandProperty ProcessId"],
+                capture_output=True, text=True, errors="ignore"
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit() and int(line) != os.getpid():
+                    bg_pids.append(line)
+        except Exception:
+            pass
+
+    # 3. Thăm dò IP hiện tại
+    rotator = ProxyRotator(
+        api_url=cfg["api_url"],
+        upstream_proxy=cfg["upstream_proxy"],
+        local_port=local_port
+    )
+    current_ip = rotator.check_health(timeout=3) if bridge_running else None
+
+    # 4. Kiểm tra session OpenCode
+    watchdog = OpenCodeWatchdog(rotator=rotator)
+    active_sessions = watchdog.get_active_sessions()
+
+    # 5. IP đã dùng hôm nay
+    used_ips = rotator.get_used_ips_summary()
+
+    # 6. Windows System Proxy
+    sys_proxy_status = "Không khả dụng"
+    if platform.system() == "Windows":
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings').ProxyEnable"],
+                capture_output=True, text=True, errors="ignore"
+            )
+            val = res.stdout.strip()
+            sys_proxy_status = "BẬT (Trỏ tới 127.0.0.1:28080)" if val == "1" else "TẮT"
+        except Exception:
+            pass
+
+    print("\n================================================================================")
+    print(" 📊 OPENCODE UNLIMITED — BẢNG TRẠNG THÁI HỆ THỐNG")
+    print("================================================================================")
+    print(f" 🔌 Local Bridge (127.0.0.1:{local_port}): {'🟢 ĐANG CHẠY' if bridge_running else '🔴 ĐÃ TẮT'}")
+    if bg_pids:
+        print(f" ⚙️ Tiến trình nền (PID):          {', '.join(bg_pids)} (Chạy ngầm)")
+    else:
+        print(f" ⚙️ Tiến trình nền:                 Không có tiến trình chạy ngầm")
+    print(f" 🌐 IP Public Hiện Tại:             {current_ip or 'Chưa kết nối / Bridge chưa bật'}")
+    print(f" 📡 Upstream Proxy:                 {cfg.get('upstream_proxy')}")
+    print(f" 🪟 Windows System Proxy:           {sys_proxy_status}")
+    print(f" 📋 Số IP đã dùng chu kỳ hôm nay:  {len(used_ips)} IP")
+    print(f" 🤖 Phiên OpenCode đang hoạt động: {len(active_sessions)} phiên ({', '.join(active_sessions) if active_sessions else 'Rảnh'})")
+    print("================================================================================\n")
+
 def main():
     parser = argparse.ArgumentParser(description="OpenCode Unlimited - Cross-Platform Automation")
+    parser.add_argument("--status", action="store_true", help="Kiểm tra trạng thái hệ thống, IP hiện tại và các tiến trình nền")
     parser.add_argument("--rotate", action="store_true", help="Chủ động xoay IP mới ngay lập tức")
     parser.add_argument("--list-ips", action="store_true", help="Xem danh sách IP đã dùng trong chu kỳ hôm nay")
     parser.add_argument("--clear-ips", action="store_true", help="Xóa sạch danh sách IP đã dùng")
@@ -157,6 +241,10 @@ def main():
     args = parser.parse_args()
 
     cfg = load_or_init_config()
+
+    if args.status:
+        show_status_dashboard(cfg)
+        return
 
     # Khởi tạo rotator
     rotator = ProxyRotator(
@@ -180,11 +268,11 @@ def main():
         print("✅ Đã xóa sạch danh sách IP đã dùng.")
         return
 
-    # Tách Host và Port của Upstream an toàn
-    u_host, u_port = parse_proxy_host_port(cfg["upstream_proxy"])
+    # Tách Host, Port và Auth của Upstream an toàn
+    u_host, u_port, u_auth = parse_proxy_host_port(cfg["upstream_proxy"])
 
     # 1. Khởi động Proxy Bridge
-    bridge = ProxyBridge(u_host, u_port, local_host="127.0.0.1", local_port=cfg["local_port"])
+    bridge = ProxyBridge(u_host, u_port, local_host="127.0.0.1", local_port=cfg["local_port"], upstream_auth=u_auth)
     bridge.start()
 
     # 2. Sinh Device ID ban đầu (và đồng bộ Registry MachineGuid trên Windows)

@@ -114,8 +114,18 @@ class ProxyRotator:
         except Exception:
             return {"ips": {}}
 
+    def prune_old_ips(self, data, max_days=3):
+        """Xóa các bản ghi IP cũ hơn max_days ngày để giữ file nhẹ và sạch."""
+        if not isinstance(data, dict) or "ips" not in data:
+            return data
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=max_days)).timestamp()
+        pruned = {ip: info for ip, info in data["ips"].items() if info.get("timestamp", 0) >= cutoff}
+        data["ips"] = pruned
+        return data
+
     def save_used_ips(self, data):
         try:
+            data = self.prune_old_ips(data)
             with open(self.used_ips_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
@@ -222,7 +232,8 @@ class ProxyRotator:
 
     def rotate(self, force=False, reason="Yêu cầu xoay IP"):
         self.log("========================================================")
-        self.log(f"🔄 Bắt đầu xoay IP tự động [Lý do: {reason}]...")
+        old_ip = self.check_health(timeout=3)
+        self.log(f"🔄 Bắt đầu xoay IP tự động [Lý do: {reason}] (IP cũ: {old_ip or 'Chưa xác định'})...")
 
         remaining_seconds = 1200
         chosen_ip = None
@@ -248,6 +259,9 @@ class ProxyRotator:
                                 clean_p = new_p.split("::")[0].strip()
                                 if clean_p:
                                     self.upstream_proxy = clean_p
+                            token_exp = api_response.get("Token expiration date")
+                            if token_exp:
+                                self.log(f"ℹ️ Hạn token proxy: {token_exp}")
                         except Exception:
                             msg = content
 
@@ -273,17 +287,25 @@ class ProxyRotator:
                     self.log(f"⚠️ Lỗi gọi API xoay IP (lần {req_attempt}/4): {e}")
                     time.sleep(3)
 
-            # 2. Đợi modem 4G hoàn tất đổi IP
+            # 2. Đợi modem 4G hoàn tất đổi IP với Dynamic Fast Probe (giảm độ trễ)
             self.log("⏳ Đang đợi modem 4G hoàn tất cấp IP mới...")
-            time.sleep(25)
+            time.sleep(5)
 
-            # 3. Thăm dò kiểm tra IP mới
+            # 3. Thăm dò nhanh kiểm tra IP mới
             new_ip = None
-            for attempt in range(1, 20):
-                new_ip = self.check_health()
-                if new_ip:
+            max_probes = 15
+            for attempt in range(1, max_probes + 1):
+                probed_ip = self.check_health(timeout=3)
+                if probed_ip:
+                    # Nếu modem vẫn đang giữ IP cũ thì tiếp tục đợi
+                    if old_ip and probed_ip == old_ip and attempt < 8:
+                        self.log(f"  · Modem đang chuyển mạch (vẫn nhận IP cũ {probed_ip}, lần {attempt}/{max_probes})...")
+                        time.sleep(2)
+                        continue
+                    new_ip = probed_ip
+                    self.log(f"⚡ Đã kết nối IP mới sau ~{attempt * 2 + 5}s: {new_ip}")
                     break
-                self.log(f"  · Đang kiểm tra kết nối proxy (lần {attempt}/20)...")
+                self.log(f"  · Đang kiểm tra kết nối proxy (lần {attempt}/{max_probes})...")
                 time.sleep(2)
 
             if not new_ip:
@@ -296,7 +318,7 @@ class ProxyRotator:
                 self.log(f"⚠️ IP {new_ip} ĐÃ TỪNG SỬ DỤNG HÔM NAY (trùng trong {len(used_list)} IP đã dùng)!")
                 self.log(f"🚫 Bỏ qua IP {new_ip} và tiếp tục xoay để lấy IP khác...")
                 self.notify("Trùng IP Cũ", f"IP {new_ip} đã dùng. Đang tự động đổi IP khác...")
-                time.sleep(3)
+                time.sleep(2)
                 continue
             else:
                 chosen_ip = new_ip
