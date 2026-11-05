@@ -11,11 +11,14 @@ Write-Host " 🛑 DỪNG CÁC TIẾN TRÌNH CHẠY NGẦM OPENCODE UNLIMITED" -F
 Write-Host "========================================================" -ForegroundColor Cyan
 
 $stopped = 0
-# Chỉ nhắm vào tiến trình Python (python/pythonw/py) chạy main.py hoặc bridge.py,
-# tránh tắt nhầm editor hay chương trình khác có "main.py" trong command line.
+$ProjectDir = (Get-Item $PSScriptRoot).Parent.Parent.FullName.TrimEnd('\').ToLower()
+# Chỉ nhắm vào tiến trình Python (python/pythonw/py) chạy main.py hoặc bridge.py CỦA THƯ MỤC NÀY
+# (start-background.vbs và run.bat luôn truyền đường dẫn tuyệt đối), tránh tắt nhầm
+# main.py / bridge.py của project khác.
 Get-CimInstance Win32_Process | Where-Object {
-    ($_.Name -match '^(python|pythonw|py)(\d+(\.\d+)*)?\.exe$') -and
-    ($_.CommandLine -match '(^|[\\/\s"])(main|bridge)\.py\b')
+    if (($_.Name -notmatch '^(python|pythonw|py)(\d+(\.\d+)*)?\.exe$') -or -not $_.CommandLine) { return $false }
+    $cmd = $_.CommandLine.Replace('/', '\').ToLower()
+    $cmd.Contains("$ProjectDir\main.py") -or $cmd.Contains("$ProjectDir\bridge.py")
 } | ForEach-Object {
     Write-Host "🛑 Đang tắt tiến trình: $($_.ProcessId) ($($_.Name))" -ForegroundColor Yellow
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue

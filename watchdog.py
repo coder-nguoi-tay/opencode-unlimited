@@ -36,6 +36,12 @@ MAX_CONSECUTIVE_SESSION_RETRIES = 3
 MAX_CONSECUTIVE_GLOBAL_LIMITS = 3
 GLOBAL_LIMIT_COOLDOWN_SECONDS = 900  # 15 phút nếu dính hạn mức toàn cầu
 
+# Tên tiến trình của OpenCode Desktop (OpenCode.exe) và CLI/backend (opencode, opencode-cli)
+OPENCODE_PROCESS_NAMES = ("opencode", "opencode-cli")
+PRESENCE_CHECK_INTERVAL_SECONDS = 30   # Tần suất kiểm tra OpenCode còn chạy khi đang tạm dừng xoay IP
+STARTUP_PENDING_CHECK_SECONDS = 5      # Tần suất kiểm tra OpenCode đã mở chưa để xử lý lỗi cũ lúc khởi động
+STARTUP_PENDING_WINDOW_SECONDS = 120   # Quá thời gian này mà OpenCode chưa mở thì bỏ qua lỗi cũ trong log
+
 class OpenCodeWatchdog:
     def __init__(self, rotator, stabilize_wait_seconds=60, auto_resume=True,
                  prompt_resume_text="Tiếp tục thực hiện các bước tiếp theo trong công việc đang làm dở."):
@@ -58,6 +64,44 @@ class OpenCodeWatchdog:
         self.circuit_broken_sessions = set()  # Các session bị khóa auto-resume để chống lặp vô tận
         self.consecutive_global_limits = 0
         self.global_limit_locked_until = 0
+        self._presence_checked_at = None
+        self._presence_cache = True
+
+    def is_opencode_running(self):
+        """Kiểm tra OpenCode (Desktop hoặc CLI) có đang chạy không.
+        Nếu không kiểm tra được thì trả về True để giữ hành vi cũ (không chặn xoay IP)."""
+        try:
+            if platform.system() == "Windows":
+                res = subprocess.run(
+                    ["tasklist", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, errors="ignore", timeout=10,
+                    # Không bật cửa sổ console khi service chạy bằng pythonw.exe
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if res.returncode != 0:
+                    return True
+                targets = {f"{n}.exe" for n in OPENCODE_PROCESS_NAMES}
+                for line in res.stdout.splitlines():
+                    image = line.split(",", 1)[0].strip().strip('"').lower()
+                    if image in targets:
+                        return True
+                return False
+
+            pattern = "|".join(OPENCODE_PROCESS_NAMES)
+            res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, timeout=10)
+            if res.returncode in (0, 1):  # 0 = có tiến trình, 1 = không có
+                return res.returncode == 0
+            return True
+        except Exception:
+            return True
+
+    def _opencode_running_cached(self, max_age):
+        """Như is_opencode_running() nhưng chỉ kiểm tra lại sau mỗi max_age giây."""
+        now = time.time()
+        if self._presence_checked_at is None or now - self._presence_checked_at >= max_age:
+            self._presence_cache = self.is_opencode_running()
+            self._presence_checked_at = now
+        return self._presence_cache
 
     def _find_opencode_binary(self):
         """Tìm đường dẫn binary thực thi của OpenCode trên hệ thống."""
@@ -378,6 +422,10 @@ class OpenCodeWatchdog:
             with open(self.log_file, "a", encoding="utf-8") as f:
                 pass
 
+        # Lỗi hạn mức cũ tìm thấy lúc khởi động: (session_hint, hạn chót) - chỉ xử lý nếu OpenCode mở trong hạn
+        pending_startup = None
+        ttl_paused = False
+
         try:
             f = open(self.log_file, "r", encoding="utf-8", errors="ignore")
             # Quét kiểm tra các dòng cuối cùng xem có lỗi limit/disconnect gần nhất chưa được xử lý không
@@ -393,12 +441,8 @@ class OpenCodeWatchdog:
                         m = re.search(r"(?:sessionID|sessionId|session\.id)=([a-zA-Z0-9_-]+)", s_line)
                         if m:
                             s_hint = m.group(1)
-                        self.log("⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất. Tự động chuẩn bị xử lý...")
-                        threading.Thread(
-                            target=self.handle_limit_and_resume,
-                            args=("Lỗi hạn mức phát hiện khi khởi động", s_hint, 2),
-                            daemon=True
-                        ).start()
+                        self.log("⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất. Sẽ xử lý ngay khi OpenCode đang chạy...")
+                        pending_startup = (s_hint, time.time() + STARTUP_PENDING_WINDOW_SECONDS)
                         break
             except Exception:
                 pass
@@ -439,16 +483,39 @@ class OpenCodeWatchdog:
                         pass
                     last_pos = f.tell()
 
-                    # Kiểm tra Proactive TTL: Nếu proxy 4G sắp hết hạn sống (còn < 45s)
                     now = time.time()
-                    if self.current_ip_expire_time > 0 and now > (self.current_ip_expire_time - 45):
-                        if (now - last_trigger_time) > 45 and not self.is_handling:
-                            last_trigger_time = now
-                            self.current_ip_expire_time = 0
+
+                    # Lỗi hạn mức cũ lúc khởi động: chỉ xoay IP + resume khi OpenCode thực sự đang chạy
+                    if pending_startup is not None:
+                        if self._opencode_running_cached(STARTUP_PENDING_CHECK_SECONDS):
+                            s_hint = pending_startup[0]
+                            pending_startup = None
                             threading.Thread(
-                                target=self.handle_proactive_ttl,
+                                target=self.handle_limit_and_resume,
+                                args=("Lỗi hạn mức phát hiện khi khởi động", s_hint, 2),
                                 daemon=True
                             ).start()
+                        elif now > pending_startup[1]:
+                            pending_startup = None
+                            self.log("ℹ️ OpenCode không được mở sau khi khởi động - bỏ qua lỗi hạn mức cũ trong log, không xoay IP.")
+
+                    # Kiểm tra Proactive TTL: Nếu proxy 4G sắp hết hạn sống (còn < 45s)
+                    # Chỉ xoay khi OpenCode đang chạy - tắt OpenCode thì tạm dừng, mở lại thì xoay tiếp
+                    if self.current_ip_expire_time > 0 and now > (self.current_ip_expire_time - 45):
+                        if (now - last_trigger_time) > 45 and not self.is_handling:
+                            if self._opencode_running_cached(PRESENCE_CHECK_INTERVAL_SECONDS):
+                                if ttl_paused:
+                                    ttl_paused = False
+                                    self.log("▶️ OpenCode đã mở lại - tiếp tục xoay IP chủ động.")
+                                last_trigger_time = now
+                                self.current_ip_expire_time = 0
+                                threading.Thread(
+                                    target=self.handle_proactive_ttl,
+                                    daemon=True
+                                ).start()
+                            elif not ttl_paused:
+                                ttl_paused = True
+                                self.log("⏸️ OpenCode đã tắt - tạm dừng xoay IP chủ động cho tới khi OpenCode mở lại.")
 
                     time.sleep(0.4)
                     continue

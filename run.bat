@@ -8,13 +8,13 @@ cd /d "%~dp0"
 
 where python >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    python main.py %*
+    python "%~dp0main.py" %*
     exit /b %ERRORLEVEL%
 )
 
 where py >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    py -3 main.py %*
+    py -3 "%~dp0main.py" %*
     exit /b %ERRORLEVEL%
 )
 

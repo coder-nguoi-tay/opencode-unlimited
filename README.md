@@ -41,7 +41,7 @@
 - 🛡️ **Anti-Duplicate IP Engine (`rotator.py`)**: Lọc bỏ IP trùng lặp trong chu kỳ ngày, tự động dọn dẹp lịch sử IP cũ.
 - ⚡ **Dynamic Fast Probe**: Giảm thời gian chờ đổi IP modem 4G xuống chỉ 5–15s thay vì 25–45s cố định.
 - 🛑 **Smart Circuit Breaker**: Tự động ngắt auto-resume nếu một session bị lỗi 3 lần liên tiếp, chống vòng lặp vô tận làm lãng phí proxy.
-- ⏱️ **Proactive TTL Rotation**: Chủ động đổi IP mới khi proxy 4G sắp hết hạn sống (< 45s) một cách mượt mà và an toàn.
+- ⏱️ **Proactive TTL Rotation**: Chủ động đổi IP mới khi proxy 4G sắp hết hạn sống (< 45s) một cách mượt mà và an toàn. Khi OpenCode đã tắt, service nền tự **tạm dừng xoay IP** (không tốn IP, không đổi Device ID) và xoay tiếp khi OpenCode mở lại; Local Bridge vẫn giữ để mở lại OpenCode là dùng được ngay.
 - ⏰ **Đồng Bộ Chu Kỳ Reset Toàn Cầu**: Tự động làm mới danh sách IP theo mốc **00:00:00 UTC (đúng 7:00 AM giờ Việt Nam)** mỗi ngày.
 - 🤖 **Auto-Resume Watchdog (`watchdog.py`)**: Tự động bơm prompt tiếp tục phiên code dang dở ngay khi có mạng mới, loại trừ các lỗi false-positive.
 - 🔑 **Cross-Platform Device Spoofer (`spoofer.py`)**: Tự làm mới Machine UUID / IOPlatformUUID ngẫu nhiên.
@@ -167,7 +167,8 @@ opencode-unlimited --launch
 > **Mẹo trên Windows**: Trong thư mục `scripts\windows\`:
 > - Chạy ngầm không cửa sổ: Chạy `start-background.vbs`
 > - Xem trạng thái nhanh: Chạy `powershell -File scripts\windows\status.ps1`
-> - Dừng hệ thống: Chạy `powershell -File scripts\windows\stop-background.ps1` (hoặc thêm `-StopOpenCode` để tắt cả OpenCode)
+> - Dừng hệ thống: Chạy `powershell -File scripts\windows\stop-background.ps1` (hoặc thêm `-StopOpenCode` để tắt cả OpenCode). Script chỉ tắt `main.py` / `bridge.py` của đúng thư mục này (được khởi chạy bằng `start-background.vbs` hoặc `run.bat`), không đụng tới project Python khác.
+> - Lưu ý: nếu tắt service nền trong khi OpenCode (mở bằng shortcut Proxy) vẫn đang chạy, OpenCode sẽ mất kết nối vì vẫn trỏ vào `127.0.0.1:28080`. Hãy mở lại OpenCode bằng shortcut **OpenCode (Proxy Unlimited)**.
 
 ---
 

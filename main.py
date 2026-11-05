@@ -174,9 +174,17 @@ def show_status_dashboard(cfg):
     bg_pids = []
     if platform.system() == "Windows":
         try:
+            # Chỉ đếm main.py của chính thư mục này (cùng cách nhận diện với stop-background.ps1)
+            main_path = os.path.abspath(__file__).replace("'", "''").lower()
+            ps_cmd = (
+                f"$t = '{main_path}'; "
+                "Get-CimInstance Win32_Process | Where-Object { "
+                "($_.Name -match 'python') -and $_.CommandLine -and "
+                "$_.CommandLine.Replace('/', '\\').ToLower().Contains($t) -and "
+                "($_.CommandLine -notmatch '--status') } | Select-Object -ExpandProperty ProcessId"
+            )
             res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance Win32_Process | Where-Object { ($_.Name -match 'python') -and ($_.CommandLine -match 'main\\.py') -and ($_.CommandLine -notmatch '--status') } | Select-Object -ExpandProperty ProcessId"],
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
                 capture_output=True, text=True, errors="ignore"
             )
             for line in res.stdout.splitlines():
