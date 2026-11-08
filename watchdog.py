@@ -34,6 +34,8 @@ if sys.platform == "win32":
 from spoofer import get_opencode_dir
 
 MAX_CONSECUTIVE_SESSION_RETRIES = 3
+SESSION_RETRY_WINDOW_SECONDS = 600     # Lỗi tới sau lần tự tiếp tục trước quá 10 phút = phiên đã chạy ổn, đếm lại từ đầu
+CIRCUIT_BREAKER_LOCK_SECONDS = 1800    # Phiên bị khóa auto-resume được mở lại sau 30 phút
 MAX_CONSECUTIVE_GLOBAL_LIMITS = 3
 GLOBAL_LIMIT_COOLDOWN_SECONDS = 900  # 15 phút nếu dính hạn mức toàn cầu
 
@@ -43,6 +45,7 @@ PRESENCE_CHECK_INTERVAL_SECONDS = 30   # Tần suất kiểm tra OpenCode còn c
 OPEN_CONFIRM_SECONDS = 8               # Tiến trình OpenCode mới phải còn sống ít nhất chừng này mới tính là "đã mở"
 STARTUP_PENDING_CHECK_SECONDS = 5      # Tần suất kiểm tra OpenCode đã mở chưa để xử lý lỗi cũ lúc khởi động
 STARTUP_PENDING_WINDOW_SECONDS = 120   # Quá thời gian này mà OpenCode chưa mở thì bỏ qua lỗi cũ trong log
+STARTUP_ERROR_MAX_AGE_SECONDS = 600    # Lỗi cũ trong log OpenCode quá 10 phút lúc khởi động thì không tự xử lý nữa
 
 # Proxy Health Monitor: khi proxy chết, OpenCode chỉ tự thử lại ("Attempt N - retrying") mà không
 # ghi gì vào log cho tới khi bỏ cuộc - có thể mất vài phút. Nên watchdog tự thăm dò proxy định kỳ.
@@ -51,6 +54,26 @@ PROXY_HEALTH_RETRY_SECONDS = 5         # Thăm dò lại nhanh sau một lần l
 PROXY_DEAD_THRESHOLD = 2               # Số lần lỗi liên tiếp để coi proxy đã chết
 PROXY_DEAD_BACKOFF_MAX_SECONDS = 600   # Xoay IP thất bại liên tục (VD: key API hỏng) thì giãn dần, tối đa 10 phút
 RECENT_ROTATION_SECONDS = 120          # ECONNRESET tới trong khoảng này sau khi vừa xoay xong là lỗi của IP cũ
+
+# Chống xoay IP liên tục khi proxy chết ngay sau mỗi lần xoay (VD: nhà cung cấp chỉ cho kết nối mới
+# ~60s sau mỗi lần gọi API). Xoay thêm cũng chết tiếp, chỉ đốt IP và cắt luôn kết nối OpenCode đang chạy.
+PROXY_FLAP_WINDOW_SECONDS = 180        # Proxy chết trong khoảng này sau khi xoay = "xoay xong lại chết ngay"
+PROXY_FLAP_THRESHOLD = 2               # Số lần liên tiếp như vậy thì tạm ngừng tự xoay theo Health Monitor
+PROXY_FLAP_HOLD_BASE_SECONDS = 300     # Thời gian tạm ngừng lần đầu, gấp đôi mỗi lần tái diễn...
+PROXY_FLAP_HOLD_MAX_SECONDS = 1800     # ...tối đa 30 phút
+
+
+def opencode_log_line_time(line):
+    """Thời điểm (epoch) của một dòng opencode.log ("timestamp=2026-11-08T18:51:56.794Z ..."), None nếu không đọc được."""
+    m = re.search(r"timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z", line or "")
+    if not m:
+        return None
+    s = m.group(1)
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s else "%Y-%m-%dT%H:%M:%S"
+        return datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def _command_args(cmdline):
@@ -203,6 +226,9 @@ class OpenCodeWatchdog:
         self.log_file = os.path.join(self.opencode_dir, "log", "opencode.log")
         self.autoreset_log = os.path.join(self.opencode_dir, "log", "opencode-autoreset.log")
         self.db_file = os.path.join(self.opencode_dir, "opencode.db")
+        # Mốc lỗi gần nhất watchdog đã thấy trong opencode.log (giữ qua các lần khởi động lại), để lúc khởi
+        # động không xử lý lại (xoay IP + gửi lệnh tiếp tục) một lỗi mà lần chạy trước đã xử lý rồi.
+        self.state_file = os.path.join(self.opencode_dir, "watchdog_state.json")
 
         self.opencode_bin = self._find_opencode_binary()
         self.lock = threading.Lock()
@@ -215,9 +241,10 @@ class OpenCodeWatchdog:
         self._probe_running = False
         self._proxy_fail_count = 0
         self._dead_proxy_failures = 0
+        self._flap_count = 0                  # Số lần liên tiếp proxy chết ngay sau khi vừa xoay
         self._next_probe_at = 0
-        self.session_retries = {}             # session_id -> int
-        self.circuit_broken_sessions = set()  # Các session bị khóa auto-resume để chống lặp vô tận
+        self.session_retries = {}             # session_id -> (số lần tự tiếp tục liên tiếp, thời điểm lần gần nhất)
+        self.circuit_broken_sessions = {}     # session_id -> thời điểm bị khóa auto-resume (chống lặp vô tận)
         self.consecutive_global_limits = 0
         self.global_limit_locked_until = 0
         self._presence_checked_at = None
@@ -373,6 +400,30 @@ class OpenCodeWatchdog:
             timeout=timeout
         )
 
+    def _load_last_seen_error_at(self):
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                value = json.load(f).get("last_seen_error_at")
+            return float(value) if isinstance(value, (int, float)) else None
+        except Exception:
+            return None
+
+    def _remember_error_line(self, line):
+        """Ghi lại mốc thời gian của dòng lỗi vừa thấy trong opencode.log (chỉ tiến lên, không lùi)."""
+        err_at = opencode_log_line_time(line)
+        if err_at is None:
+            return
+        last = self._load_last_seen_error_at()
+        if last is not None and err_at <= last:
+            return
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"last_seen_error_at": err_at}, f)
+            os.replace(tmp, self.state_file)
+        except Exception:
+            pass
+
     def log(self, msg):
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{now}] {msg}"
@@ -399,7 +450,8 @@ class OpenCodeWatchdog:
     def get_latest_session_id(self, max_idle_seconds=900):
         """Lấy session ID gần nhất từ database SQLite của OpenCode (mở chế độ read-only an toàn).
         Chỉ trả về session nếu vừa được cập nhật trong max_idle_seconds (mặc định 15 phút)
-        và chưa hoàn tất thành công (không resume session đã xong)."""
+        và chưa hoàn tất thành công (không resume session đã xong).
+        idle_outcome: NULL khi đang chạy, 'succeeded' / 'failed' khi dừng (OpenCode 2.x; bản cũ ghi 'completed')."""
         if not os.path.exists(self.db_file):
             return None
         conn = None
@@ -419,7 +471,7 @@ class OpenCodeWatchdog:
                 cursor.execute("""
                     SELECT id FROM session_v2 
                     WHERE time_archived IS NULL 
-                      AND (idle_outcome IS NULL OR idle_outcome != 'completed')
+                      AND (idle_outcome IS NULL OR idle_outcome NOT IN ('succeeded', 'completed'))
                       AND time_updated >= ?
                     ORDER BY time_updated DESC 
                     LIMIT 1;
@@ -558,7 +610,10 @@ class OpenCodeWatchdog:
         )
 
     def _probe_proxy_health(self):
-        """Chạy trong thread riêng: thăm dò proxy, chết PROXY_DEAD_THRESHOLD lần liên tiếp thì xoay IP."""
+        """Chạy trong thread riêng: thăm dò proxy, chết PROXY_DEAD_THRESHOLD lần liên tiếp thì xoay IP.
+        Nếu proxy cứ chết ngay sau mỗi lần xoay (PROXY_FLAP_*) thì tạm ngừng tự xoay, giãn dần thời gian
+        thăm dò: lỗi kiểu này nằm ở nhà cung cấp, xoay thêm chỉ đốt IP. Lỗi OpenCode ghi trong log
+        (hết hạn mức, ECONNRESET...) vẫn được xử lý bình thường (xoay IP + gửi lệnh tiếp tục)."""
         try:
             ip = self.rotator.check_health(timeout=4, quick=True)
             now = time.time()
@@ -572,6 +627,12 @@ class OpenCodeWatchdog:
                     self.log(f"✅ Proxy đã phản hồi lại bình thường (IP: {ip}).")
                 self._proxy_fail_count = 0
                 self._dead_proxy_failures = 0
+                # Chỉ coi là hết "xoay xong chết ngay" khi IP sống qua được PROXY_FLAP_WINDOW_SECONDS
+                # (ngay sau khi xoay thì proxy lúc nào cũng phản hồi, chưa nói lên được gì)
+                if self._flap_count and now - self.last_rotation_ok_at >= PROXY_FLAP_WINDOW_SECONDS:
+                    self.log(f"✅ IP {ip} đã sống ổn định quá {PROXY_FLAP_WINDOW_SECONDS}s sau khi xoay - "
+                             "Health Monitor tự xoay IP trở lại như bình thường.")
+                    self._flap_count = 0
                 self._next_probe_at = now + PROXY_HEALTH_INTERVAL_SECONDS
                 return
 
@@ -584,6 +645,25 @@ class OpenCodeWatchdog:
 
             self._proxy_fail_count = 0
             self.current_ip_expire_time = 0  # IP đã chết - bỏ hẹn giờ TTL cũ
+
+            since_rotation = now - self.last_rotation_ok_at
+            if self.last_rotation_ok_at and since_rotation < PROXY_FLAP_WINDOW_SECONDS:
+                self._flap_count += 1
+                if self._flap_count >= PROXY_FLAP_THRESHOLD:
+                    hold = min(PROXY_FLAP_HOLD_MAX_SECONDS,
+                               PROXY_FLAP_HOLD_BASE_SECONDS * 2 ** (self._flap_count - PROXY_FLAP_THRESHOLD))
+                    self.log(f"🛑 [PROXY MONITOR] Proxy lại chết chỉ ~{int(since_rotation)}s sau khi xoay "
+                             f"({self._flap_count} lần liên tiếp) - nhiều khả năng lỗi phía nhà cung cấp proxy "
+                             "(không nhận kết nối mới), không phải do IP. Xoay thêm chỉ đốt IP và cắt kết nối "
+                             f"OpenCode đang chạy, nên tạm ngừng tự xoay {hold // 60} phút. Lỗi OpenCode báo trong "
+                             "log vẫn được xử lý (xoay IP + gửi lệnh tiếp tục). Nên kiểm tra key/gói proxy.")
+                    self.rotator.notify(
+                        "OpenCode Proxy Monitor",
+                        f"Proxy chết ngay sau mỗi lần xoay. Tạm ngừng tự xoay {hold // 60} phút - kiểm tra key proxy.",
+                    )
+                    self._next_probe_at = now + hold
+                    return
+
             result = self.handle_dead_proxy()
             if result is False:
                 self._dead_proxy_failures += 1
@@ -600,6 +680,19 @@ class OpenCodeWatchdog:
             self._next_probe_at = time.time() + PROXY_HEALTH_INTERVAL_SECONDS
         finally:
             self._probe_running = False
+
+    def _is_circuit_broken(self, session_id, now):
+        """True nếu phiên đang bị khóa auto-resume. Khóa hết hạn sau CIRCUIT_BREAKER_LOCK_SECONDS: phiên
+        bị khóa không tự lỗi lại được (không còn ai gửi lệnh tiếp tục), nên lỗi mới tới sau đó là do người
+        dùng đã cho phiên chạy lại - xử lý như một chuỗi lỗi mới."""
+        broken_at = self.circuit_broken_sessions.get(session_id)
+        if broken_at is None:
+            return False
+        if now - broken_at < CIRCUIT_BREAKER_LOCK_SECONDS:
+            return True
+        del self.circuit_broken_sessions[session_id]
+        self.log(f"🔓 [CIRCUIT BREAKER] Hết thời gian khóa - mở lại auto-resume cho phiên {session_id}.")
+        return False
 
     def handle_limit_and_resume(self, reason, session_hint=None, delay_seconds=0):
         with self.lock:
@@ -662,8 +755,11 @@ class OpenCodeWatchdog:
             self.log(f"   Target Session: {target_session or 'Chưa xác định'}")
 
             # Kiểm tra Circuit Breaker đối với session này
-            if target_session and target_session in self.circuit_broken_sessions:
-                self.log(f"⛔ [CIRCUIT BREAKER] Phiên {target_session} đang bị tạm khóa auto-resume do lỗi liên tiếp {MAX_CONSECUTIVE_SESSION_RETRIES} lần.")
+            if target_session and self._is_circuit_broken(target_session, now):
+                left_min = max(1, int((self.circuit_broken_sessions[target_session]
+                                       + CIRCUIT_BREAKER_LOCK_SECONDS - now) / 60))
+                self.log(f"⛔ [CIRCUIT BREAKER] Phiên {target_session} đang bị tạm khóa auto-resume do lỗi liên tiếp "
+                         f"{MAX_CONSECUTIVE_SESSION_RETRIES} lần (mở lại sau ~{left_min} phút).")
                 self.log("   Bỏ qua trigger tự động để tránh lặp vô tận và tiết kiệm proxy.")
                 self.log("========================================================")
                 return
@@ -710,18 +806,27 @@ class OpenCodeWatchdog:
 
             # 6. Tự động gửi prompt tiếp tục nếu được bật
             if self.auto_resume and target_session:
-                cur_retries = self.session_retries.get(target_session, 0) + 1
-                self.session_retries[target_session] = cur_retries
+                attempt_at = time.time()
+                prev_retries, prev_at = self.session_retries.get(target_session, (0, 0))
+                if attempt_at - prev_at > SESSION_RETRY_WINDOW_SECONDS:
+                    # Lần tự tiếp tục trước đã lâu (phiên chạy ổn ở giữa) - không phải lỗi liên tiếp
+                    prev_retries = 0
 
-                if cur_retries >= MAX_CONSECUTIVE_SESSION_RETRIES:
-                    self.circuit_broken_sessions.add(target_session)
-                    self.log(f"⛔ [CIRCUIT BREAKER KÍCH HOẠT] Phiên {target_session} đã thử auto-resume {cur_retries} lần liên tiếp.")
-                    self.log(f"   Tạm dừng auto-resume cho phiên này để chống vòng lặp vô tận. Vui lòng kiểm tra lại task.")
+                if prev_retries >= MAX_CONSECUTIVE_SESSION_RETRIES:
+                    # Đã tự tiếp tục đủ MAX lần, lần nào cũng lỗi lại ngay - dừng để chống vòng lặp vô tận
+                    self.circuit_broken_sessions[target_session] = attempt_at
+                    self.session_retries.pop(target_session, None)
+                    self.log(f"⛔ [CIRCUIT BREAKER KÍCH HOẠT] Phiên {target_session} vẫn lỗi sau {prev_retries} lần "
+                             "tự gửi lệnh tiếp tục liên tiếp.")
+                    self.log(f"   Tạm dừng auto-resume cho phiên này {CIRCUIT_BREAKER_LOCK_SECONDS // 60} phút để chống "
+                             "vòng lặp vô tận. Vui lòng kiểm tra lại task.")
                     self.rotator.notify(
                         "OpenCode Circuit Breaker",
-                        f"Tạm dừng auto-resume phiên {target_session[:8]} do lỗi 3 lần liên tiếp."
+                        f"Tạm dừng auto-resume phiên {target_session[:8]} do lỗi {prev_retries} lần liên tiếp."
                     )
                 else:
+                    cur_retries = prev_retries + 1
+                    self.session_retries[target_session] = (cur_retries, attempt_at)
                     self.log(f"🚀 Hết thời gian chờ! Tự động gửi lệnh tiếp tục phiên {target_session} (Thử lần {cur_retries}/{MAX_CONSECUTIVE_SESSION_RETRIES})...")
                     ok, _ = self.send_resume_prompt(target_session)
                     if ok:
@@ -769,16 +874,30 @@ class OpenCodeWatchdog:
                 curr_size = os.path.getsize(self.log_file)
                 f.seek(max(0, curr_size - 15000), os.SEEK_SET)
                 startup_lines = f.readlines()
-                for s_line in startup_lines[-10:]:
+                last_seen_error_at = self._load_last_seen_error_at()
+                for s_line in reversed(startup_lines[-10:]):  # Lỗi mới nhất trước
                     s_lower = s_line.lower()
-                    if ("free usage limit reached" in s_lower or "quotaexceeded" in s_lower or 
+                    if ("free usage limit reached" in s_lower or "quotaexceeded" in s_lower or
                         "free messages" in s_lower or "econnreset" in s_lower) and ("failed to drain" in s_lower or "limit reached" in s_lower):
+                        err_at = opencode_log_line_time(s_line)
+                        err_time = (datetime.datetime.fromtimestamp(err_at).strftime("%H:%M:%S")
+                                    if err_at is not None else "?")
+                        if err_at is not None and last_seen_error_at is not None and err_at <= last_seen_error_at:
+                            self.log(f"ℹ️ Lỗi gần nhất trong log OpenCode (lúc {err_time}) đã được lần chạy trước "
+                                     "xử lý - bỏ qua, không xoay IP / gửi lệnh tiếp tục lại.")
+                            break
+                        if err_at is not None and time.time() - err_at > STARTUP_ERROR_MAX_AGE_SECONDS:
+                            self.log(f"ℹ️ Lỗi gần nhất trong log OpenCode (lúc {err_time}) đã cũ hơn "
+                                     f"{STARTUP_ERROR_MAX_AGE_SECONDS // 60} phút - bỏ qua, không tự xử lý.")
+                            break
                         s_hint = None
                         m = re.search(r"(?:sessionID|sessionId|session\.id)=([a-zA-Z0-9_-]+)", s_line)
                         if m:
                             s_hint = m.group(1)
-                        self.log("⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất. Sẽ xử lý ngay khi OpenCode đang chạy...")
+                        self.log(f"⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất (lúc {err_time}) chưa được "
+                                 "xử lý. Sẽ xử lý ngay khi OpenCode đang chạy...")
                         pending_startup = (s_hint, time.time() + STARTUP_PENDING_WINDOW_SECONDS)
+                        self._remember_error_line(s_line)
                         break
             except Exception:
                 pass
@@ -907,6 +1026,8 @@ class OpenCodeWatchdog:
                         reason = "ECONNRESET / Socket Reset (trong phiên làm việc)"
 
                 if is_trigger:
+                    # Ghi mốc lỗi đã thấy (kể cả khi bỏ qua bên dưới) để lần khởi động sau không xử lý lại
+                    self._remember_error_line(line)
                     now = time.time()
                     if now - last_trigger_time < 25:
                         continue

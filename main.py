@@ -283,6 +283,16 @@ def main():
     bridge = ProxyBridge(u_host, u_port, local_host="127.0.0.1", local_port=cfg["local_port"], upstream_auth=u_auth)
     bridge.start()
 
+    def apply_new_upstream(upstream_str):
+        """API xoay IP trả về Upstream proxy khác: chuyển Local Bridge sang dùng nó cho các kết nối mới."""
+        old = f"{bridge.upstream_host}:{bridge.upstream_port}"
+        host, port, auth = parse_proxy_host_port(upstream_str)
+        # API thường chỉ trả host:port - giữ thông tin xác thực trong config nếu có
+        if bridge.set_upstream(host, port, auth or u_auth):
+            rotator.log(f"🔀 API trả về Upstream proxy mới: {old} -> {host}:{port} - Local Bridge đã chuyển sang.")
+
+    rotator.on_upstream_change = apply_new_upstream
+
     # 2. Sinh Device ID ban đầu (và đồng bộ Registry MachineGuid trên Windows)
     initial_device_id = setup_spoofer()
 

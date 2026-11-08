@@ -29,57 +29,75 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 class ProxyBridge:
-    def __init__(self, upstream_host, upstream_port, local_host="127.0.0.1", local_port=28080, upstream_auth=None, logger=None):
-        self.upstream_host = upstream_host
-        self.upstream_port = int(upstream_port)
+    def __init__(self, upstream_host, upstream_port, local_host="127.0.0.1", local_port=28080, upstream_auth=None,
+                 logger=None, idle_timeout=90.0):
+        # (host, port, auth) đổi được khi đang chạy qua set_upstream(); kết nối mới dùng giá trị mới nhất
+        self._upstream = (upstream_host, int(upstream_port), upstream_auth)
         self.local_host = local_host
         self.local_port = int(local_port)
-        self.upstream_auth = upstream_auth
+        # Đóng kết nối zombie khi CẢ HAI chiều cùng im lặng quá idle_timeout giây
+        self.idle_timeout = float(idle_timeout)
         self.logger = logger or logging.getLogger("ProxyBridge")
         self.server = None
         self.loop = None
         self.thread = None
         self.running = False
 
-    async def _pipe_client_to_remote(self, reader, writer):
-        try:
-            first_chunk = True
-            while self.running and not reader.at_eof():
-                data = await asyncio.wait_for(reader.read(16384), timeout=90.0)
-                if not data:
-                    break
-                if first_chunk and self.upstream_auth:
-                    first_chunk = False
-                    # Nếu là CONNECT hoặc HTTP request, inject Proxy-Authorization
-                    if data.startswith(b"CONNECT ") or data.startswith(b"GET ") or data.startswith(b"POST "):
-                        import base64
-                        auth_str = f"Proxy-Authorization: Basic {base64.b64encode(self.upstream_auth.encode()).decode()}\r\n".encode()
-                        if b"\r\n\r\n" in data:
-                            header_part, rest = data.split(b"\r\n\r\n", 1)
-                            data = header_part + b"\r\n" + auth_str + b"\r\n" + rest
-                writer.write(data)
-                await writer.drain()
-        except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
-            pass
-        except Exception:
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+    @property
+    def upstream_host(self):
+        return self._upstream[0]
 
-    async def _pipe(self, reader, writer):
+    @property
+    def upstream_port(self):
+        return self._upstream[1]
+
+    @property
+    def upstream_auth(self):
+        return self._upstream[2]
+
+    def set_upstream(self, host, port, auth=None):
+        """Đổi Upstream Proxy cho các kết nối mới (VD: API xoay IP trả về cổng proxy mới).
+        Kết nối đang mở giữ nguyên upstream cũ. Trả về True nếu upstream thực sự thay đổi."""
+        new = (host, int(port), auth)
+        changed = new != self._upstream
+        self._upstream = new
+        return changed
+
+    @staticmethod
+    def _inject_proxy_auth(data, auth):
+        """Chèn Proxy-Authorization vào request đầu tiên (CONNECT hoặc HTTP) gửi tới upstream."""
+        if data.startswith(b"CONNECT ") or data.startswith(b"GET ") or data.startswith(b"POST "):
+            import base64
+            auth_str = f"Proxy-Authorization: Basic {base64.b64encode(auth.encode()).decode()}\r\n".encode()
+            if b"\r\n\r\n" in data:
+                header_part, rest = data.split(b"\r\n\r\n", 1)
+                data = header_part + b"\r\n" + auth_str + b"\r\n" + rest
+        return data
+
+    async def _pipe(self, reader, writer, activity, inject_auth=None):
+        """Chuyển dữ liệu một chiều reader -> writer.
+        activity[0] là thời điểm có dữ liệu gần nhất ở BẤT KỲ chiều nào của kết nối: chỉ đóng khi cả hai
+        chiều cùng im lặng quá idle_timeout. Trước đây mỗi chiều tự tính timeout riêng nên một response
+        stream dài (client không gửi gì thêm, VD: LLM trả lời > 90s) bị cắt ngang giữa chừng."""
+        first_chunk = True
         try:
             while self.running and not reader.at_eof():
-                # Chống treo kết nối zombie với timeout 90s
-                data = await asyncio.wait_for(reader.read(16384), timeout=90.0)
+                remaining = self.idle_timeout - (time.monotonic() - activity[0])
+                if remaining <= 0:
+                    break  # Cả hai chiều cùng im lặng quá lâu: kết nối zombie
+                try:
+                    data = await asyncio.wait_for(reader.read(16384), timeout=remaining)
+                except asyncio.TimeoutError:
+                    continue  # Kiểm tra lại: chiều kia có thể vừa có dữ liệu
                 if not data:
                     break
+                activity[0] = time.monotonic()
+                if first_chunk and inject_auth:
+                    data = self._inject_proxy_auth(data, inject_auth)
+                first_chunk = False
                 writer.write(data)
                 await writer.drain()
-        except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
         except Exception:
             pass
@@ -91,11 +109,12 @@ class ProxyBridge:
                 pass
 
     async def _handle_connection(self, client_reader, client_writer):
+        upstream_host, upstream_port, upstream_auth = self._upstream
         remote_reader = None
         remote_writer = None
         try:
             remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(self.upstream_host, self.upstream_port),
+                asyncio.open_connection(upstream_host, upstream_port),
                 timeout=10.0
             )
         except Exception:
@@ -106,9 +125,10 @@ class ProxyBridge:
                 pass
             return
 
+        activity = [time.monotonic()]
         await asyncio.gather(
-            self._pipe_client_to_remote(client_reader, remote_writer),
-            self._pipe(remote_reader, client_writer),
+            self._pipe(client_reader, remote_writer, activity, inject_auth=upstream_auth),
+            self._pipe(remote_reader, client_writer, activity),
             return_exceptions=True
         )
 

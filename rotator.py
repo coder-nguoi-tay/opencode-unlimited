@@ -44,6 +44,9 @@ class ProxyRotator:
         self.cooldown_extra_seconds = int(cooldown_extra_seconds)
         self.max_dedup_attempts = int(max_dedup_attempts)
         self.logger = logger
+        # Gọi on_upstream_change(upstream_str) khi API trả về Upstream proxy mới, để Local Bridge chuyển
+        # sang dùng nó (nếu không, bridge vẫn trỏ vào upstream cũ trong config).
+        self.on_upstream_change = None
         self.opencode_dir = get_opencode_dir()
         self.used_ips_file = os.path.join(self.opencode_dir, "used_ips.json")
         # Lưu IP đang dùng + hạn sống để khởi động lại tool vẫn biết khi nào IP sắp chết
@@ -291,8 +294,13 @@ class ProxyRotator:
                             new_p = api_response.get("proxyhttp")
                             if new_p and "::" in new_p:
                                 clean_p = new_p.split("::")[0].strip()
-                                if clean_p:
+                                if clean_p and clean_p != self.upstream_proxy:
                                     self.upstream_proxy = clean_p
+                                    if self.on_upstream_change:
+                                        try:
+                                            self.on_upstream_change(clean_p)
+                                        except Exception as e:
+                                            self.log(f"⚠️ Không cập nhật được Upstream mới cho Local Bridge: {e}")
                             token_exp = api_response.get("Token expiration date")
                             if token_exp:
                                 self.log(f"ℹ️ Hạn token proxy: {token_exp}")
