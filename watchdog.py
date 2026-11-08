@@ -40,6 +40,7 @@ GLOBAL_LIMIT_COOLDOWN_SECONDS = 900  # 15 phút nếu dính hạn mức toàn c�
 # Tên tiến trình của OpenCode Desktop (OpenCode.exe) và CLI/backend (opencode, opencode-cli)
 OPENCODE_PROCESS_NAMES = ("opencode", "opencode-cli")
 PRESENCE_CHECK_INTERVAL_SECONDS = 30   # Tần suất kiểm tra OpenCode còn chạy khi đang tạm dừng xoay IP
+OPEN_CONFIRM_SECONDS = 8               # Tiến trình OpenCode mới phải còn sống ít nhất chừng này mới tính là "đã mở"
 STARTUP_PENDING_CHECK_SECONDS = 5      # Tần suất kiểm tra OpenCode đã mở chưa để xử lý lỗi cũ lúc khởi động
 STARTUP_PENDING_WINDOW_SECONDS = 120   # Quá thời gian này mà OpenCode chưa mở thì bỏ qua lỗi cũ trong log
 
@@ -73,6 +74,82 @@ def is_background_opencode_process(cmdline):
     if subcommand == "api":
         return True
     return subcommand == "serve" and "--service" in args
+
+
+def _toolhelp_process_pids(exe_names):
+    """{pid} của các tiến trình có tên file .exe (viết thường) thuộc exe_names, đọc thẳng từ Windows qua
+    Toolhelp32 - chỉ mất vài ms, không phụ thuộc tasklist/WMI (có lúc chậm quá 10s khi máy bận)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    ERROR_NO_MORE_FILES = 18
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        pids = set()
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() in exe_names:
+                pids.add(int(entry.th32ProcessID))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        err = ctypes.get_last_error()
+        if err != ERROR_NO_MORE_FILES:
+            raise ctypes.WinError(err)
+        return pids
+    finally:
+        kernel32.CloseHandle(snap)
+
+
+def _tasklist_process_pids(exe_names):
+    """Như _toolhelp_process_pids nhưng qua tasklist (dự phòng)."""
+    res = subprocess.run(
+        ["tasklist", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, errors="ignore", timeout=15,
+        # Không bật cửa sổ console khi service chạy bằng pythonw.exe
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"tasklist lỗi (exit {res.returncode})")
+    pids = set()
+    for row in csv.reader(res.stdout.splitlines()):
+        if len(row) >= 2 and row[0].strip().lower() in exe_names and row[1].strip().isdigit():
+            pids.add(int(row[1]))
+    return pids
+
+
+def _windows_opencode_pids():
+    exe_names = {f"{n}.exe" for n in OPENCODE_PROCESS_NAMES}
+    try:
+        return _toolhelp_process_pids(exe_names)
+    except Exception:
+        return _tasklist_process_pids(exe_names)
 
 
 def _windows_command_lines(pids):
@@ -145,67 +222,87 @@ class OpenCodeWatchdog:
         self.global_limit_locked_until = 0
         self._presence_checked_at = None
         self._presence_cache = True
-        self._background_pids = {}            # pid -> True nếu là tiến trình nền (command line không đổi theo PID)
+        self._presence_recheck_at = 0         # Kiểm tra lại sớm để xác nhận tiến trình OpenCode vừa xuất hiện
+        self._presence_error_logged = False
+        self._open_reason = ""                # Tiến trình làm watchdog coi là OpenCode đang mở (để ghi log)
+        # pid -> {"bg": True/False/None (chưa đọc được command line), "cmd": str, "first_seen": time}
+        self._pid_info = {}
 
     def is_opencode_running(self):
         """Kiểm tra người dùng có đang mở OpenCode (cửa sổ Desktop hoặc CLI) không.
+        - True: có tiến trình OpenCode không chạy ngầm, đã sống ít nhất OPEN_CONFIRM_SECONDS.
+        - False: không có.
+        - None: chưa chắc (vừa thấy tiến trình mới, cần xác nhận lại) hoặc không kiểm tra được.
+          Khi đó giữ nguyên trạng thái trước, KHÔNG tự coi là đang mở - trước đây chỉ một lần
+          tasklist chậm/lỗi là watchdog tưởng OpenCode mở lại và xoay IP dù không ai mở.
         Bỏ qua tiến trình chạy ngầm (xem is_background_opencode_process): đóng cửa sổ Desktop thì
-        backend "opencode-cli serve --service" vẫn còn nhưng OpenCode coi như đã tắt.
-        Nếu không kiểm tra được thì trả về True để giữ hành vi cũ (không chặn xoay IP)."""
+        backend "opencode-cli serve --service" vẫn còn nhưng OpenCode coi như đã tắt."""
         try:
             if platform.system() == "Windows":
-                res = subprocess.run(
-                    ["tasklist", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, errors="ignore", timeout=10,
-                    # Không bật cửa sổ console khi service chạy bằng pythonw.exe
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                if res.returncode != 0:
-                    return True
-                targets = {f"{n}.exe" for n in OPENCODE_PROCESS_NAMES}
-                pids = set()
-                for row in csv.reader(res.stdout.splitlines()):
-                    if len(row) >= 2 and row[0].strip().lower() in targets and row[1].strip().isdigit():
-                        pids.add(int(row[1]))
-                return self._has_foreground_opencode(pids, _windows_command_lines)
-
-            pattern = "|".join(OPENCODE_PROCESS_NAMES)
-            res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, text=True, timeout=10)
-            if res.returncode == 1:  # 1 = không có tiến trình
-                return False
-            if res.returncode != 0:
-                return True
-            pids = {int(p) for p in res.stdout.split() if p.isdigit()}
-            return self._has_foreground_opencode(pids, _posix_command_lines)
-        except Exception:
-            return True
+                pids = _windows_opencode_pids()
+                result = self._has_foreground_opencode(pids, _windows_command_lines)
+            else:
+                pattern = "|".join(OPENCODE_PROCESS_NAMES)
+                res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, text=True, timeout=10)
+                if res.returncode not in (0, 1):  # 1 = không có tiến trình
+                    raise RuntimeError(f"pgrep lỗi (exit {res.returncode})")
+                pids = {int(p) for p in res.stdout.split() if p.isdigit()}
+                result = self._has_foreground_opencode(pids, _posix_command_lines)
+            self._presence_error_logged = False
+            return result
+        except Exception as e:
+            if not self._presence_error_logged:
+                self._presence_error_logged = True
+                self.log(f"⚠️ Không kiểm tra được OpenCode có đang mở không ({type(e).__name__}: {e}) - "
+                         "giữ nguyên trạng thái hiện tại.")
+            return None
 
     def _has_foreground_opencode(self, pids, fetch_command_lines):
-        """Có PID nào trong số này không phải tiến trình nền không. Chỉ đọc command line của PID mới gặp."""
-        self._background_pids = {p: bg for p, bg in self._background_pids.items() if p in pids}
-        unknown = [p for p in pids if p not in self._background_pids]
+        """True/False/None như is_opencode_running(). Chỉ đọc command line của PID chưa biết."""
+        now = time.time()
+        self._pid_info = {p: info for p, info in self._pid_info.items() if p in pids}
+        for p in pids:
+            self._pid_info.setdefault(p, {"bg": None, "cmd": "", "first_seen": now})
+
+        unknown = [p for p in pids if self._pid_info[p]["bg"] is None]
         if unknown:
             cmdlines = fetch_command_lines(unknown)
             for pid in unknown:
-                if pid in cmdlines:  # PID không có trong kết quả = đã thoát
-                    # Không đọc được command line thì coi như OpenCode đang mở (an toàn như hành vi cũ)
-                    cmd = cmdlines[pid]
-                    self._background_pids[pid] = bool(cmd) and is_background_opencode_process(cmd)
-        return any(self._background_pids.get(p) is False for p in pids)
+                if pid not in cmdlines:  # PID không có trong kết quả = đã thoát
+                    del self._pid_info[pid]
+                    continue
+                cmd = cmdlines[pid]
+                if cmd:
+                    self._pid_info[pid].update(bg=is_background_opencode_process(cmd), cmd=cmd)
+                # Không đọc được command line (VD: tiến trình đang thoát, chạy quyền admin): đọc lại lần sau
+
+        pending = False
+        for pid, info in self._pid_info.items():
+            if info["bg"] is True:
+                continue
+            if now - info["first_seen"] >= OPEN_CONFIRM_SECONDS:
+                # Đã sống đủ lâu: tiến trình thật của người dùng (đọc mãi không ra command line cũng tính là mở)
+                self._open_reason = f"PID {pid}: {info['cmd'] or '(không đọc được command line)'}"
+                return True
+            pending = True  # Mới xuất hiện: chờ xác nhận, bỏ qua lệnh chạy chớp nhoáng (VD: --version)
+        return None if pending else False
 
     def _opencode_running_cached(self, max_age):
         """Như is_opencode_running() nhưng chỉ kiểm tra lại sau mỗi max_age giây. Ghi log khi OpenCode đóng/mở."""
         now = time.time()
-        if self._presence_checked_at is None or now - self._presence_checked_at >= max_age:
+        due = self._presence_checked_at is None or now - self._presence_checked_at >= max_age
+        if due or (self._presence_recheck_at and now >= self._presence_recheck_at):
             running = self.is_opencode_running()
-            if running != self._presence_cache:
+            self._presence_checked_at = now
+            self._presence_recheck_at = now + OPEN_CONFIRM_SECONDS if running is None else 0
+            if running is not None and running != self._presence_cache:
                 if running:
-                    self.log("▶️ OpenCode đã mở lại - tiếp tục thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục.")
+                    self.log("▶️ OpenCode đã mở lại - tiếp tục thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục. "
+                             f"[{self._open_reason[:200]}]")
                 else:
                     self.log("⏸️ OpenCode đã đóng - tạm dừng thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục "
                              "cho tới khi OpenCode mở lại (Local Bridge vẫn chạy).")
-            self._presence_cache = running
-            self._presence_checked_at = now
+                self._presence_cache = running
         return self._presence_cache
 
     def _find_opencode_binary(self):
