@@ -175,8 +175,91 @@ def _windows_opencode_pids():
         return _tasklist_process_pids(exe_names)
 
 
+def _ntquery_command_lines(pids):
+    """{pid: command line} của các PID còn sống ("" nếu không đọc được), đọc qua NtQueryInformationProcess
+    (ProcessCommandLineInformation) - chỉ cần quyền PROCESS_QUERY_LIMITED_INFORMATION (Windows 8.1+).
+    WMI (Get-CimInstance) phải đọc bộ nhớ tiến trình (PROCESS_VM_READ), mà backend "opencode-cli serve
+    --service" của OpenCode Desktop chặn quyền này: WMI trả command line rỗng, watchdog không nhận ra đó là
+    backend chạy ngầm, cứ tưởng OpenCode vẫn mở và tiếp tục thăm dò proxy + xoay IP dù đã đóng OpenCode."""
+    import ctypes
+    from ctypes import wintypes
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_COMMAND_LINE_INFORMATION = 60
+    ERROR_INVALID_PARAMETER = 87            # OpenProcess: PID không còn tồn tại
+    STILL_ACTIVE = 259
+    STATUS_INVALID_INFO_CLASS = 0xC0000003  # Windows cũ hơn 8.1
+    STATUS_SIZE_ERRORS = (0xC0000004, 0x80000005, 0xC0000023)  # INFO_LENGTH_MISMATCH, BUFFER_OVERFLOW, BUFFER_TOO_SMALL
+
+    out = {}
+    for pid in pids:
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            if ctypes.get_last_error() != ERROR_INVALID_PARAMETER:
+                out[pid] = ""  # Còn sống nhưng không mở được
+            continue
+        try:
+            code = wintypes.DWORD(0)
+            if kernel32.GetExitCodeProcess(h, ctypes.byref(code)) and code.value != STILL_ACTIVE:
+                continue  # Đã thoát, chỉ còn handle do tiến trình khác giữ
+            size = 4096
+            for _ in range(3):
+                buf = ctypes.create_string_buffer(size)
+                needed = ctypes.c_ulong(0)
+                status = ntdll.NtQueryInformationProcess(
+                    h, PROCESS_COMMAND_LINE_INFORMATION, buf, size, ctypes.byref(needed)) & 0xFFFFFFFF
+                if status in STATUS_SIZE_ERRORS and needed.value > size:
+                    size = needed.value
+                    continue
+                break
+            if status == STATUS_INVALID_INFO_CLASS:
+                raise OSError("NtQueryInformationProcess không hỗ trợ ProcessCommandLineInformation")
+            cmd = ""
+            if status == 0:
+                us = UNICODE_STRING.from_buffer(buf)
+                if us.Buffer and us.Length:
+                    cmd = ctypes.wstring_at(us.Buffer, us.Length // 2)
+            out[pid] = cmd.strip()
+        finally:
+            kernel32.CloseHandle(h)
+    return out
+
+
 def _windows_command_lines(pids):
-    """{pid: command line} của các PID còn sống ("" nếu không đọc được, VD: tiến trình chạy quyền admin)."""
+    """{pid: command line} của các PID còn sống ("" nếu không đọc được). Đọc qua NtQueryInformationProcess,
+    PID nào không đọc được (hoặc Windows quá cũ) thì thử lại qua WMI."""
+    try:
+        out = _ntquery_command_lines(pids)
+    except Exception:
+        return _cim_command_lines(pids)
+    unreadable = [p for p, cmd in out.items() if not cmd]
+    if unreadable:
+        try:
+            cim = _cim_command_lines(unreadable)
+        except Exception:
+            cim = {}
+        for p in unreadable:
+            if cim.get(p):
+                out[p] = cim[p]
+    return out
+
+
+def _cim_command_lines(pids):
+    """Như _ntquery_command_lines nhưng qua WMI (dự phòng)."""
     flt = " OR ".join(f"ProcessId={int(p)}" for p in pids)
     ps_cmd = (
         "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
