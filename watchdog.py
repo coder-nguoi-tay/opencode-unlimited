@@ -34,14 +34,18 @@ if sys.platform == "win32":
 from spoofer import get_opencode_dir
 
 MAX_CONSECUTIVE_SESSION_RETRIES = 3
+SESSION_RETRY_WINDOW_SECONDS = 600     # Lỗi tới sau lần tự tiếp tục trước quá 10 phút = phiên đã chạy ổn, đếm lại từ đầu
+CIRCUIT_BREAKER_LOCK_SECONDS = 1800    # Phiên bị khóa auto-resume được mở lại sau 30 phút
 MAX_CONSECUTIVE_GLOBAL_LIMITS = 3
 GLOBAL_LIMIT_COOLDOWN_SECONDS = 900  # 15 phút nếu dính hạn mức toàn cầu
 
 # Tên tiến trình của OpenCode Desktop (OpenCode.exe) và CLI/backend (opencode, opencode-cli)
 OPENCODE_PROCESS_NAMES = ("opencode", "opencode-cli")
 PRESENCE_CHECK_INTERVAL_SECONDS = 30   # Tần suất kiểm tra OpenCode còn chạy khi đang tạm dừng xoay IP
+OPEN_CONFIRM_SECONDS = 8               # Tiến trình OpenCode mới phải còn sống ít nhất chừng này mới tính là "đã mở"
 STARTUP_PENDING_CHECK_SECONDS = 5      # Tần suất kiểm tra OpenCode đã mở chưa để xử lý lỗi cũ lúc khởi động
 STARTUP_PENDING_WINDOW_SECONDS = 120   # Quá thời gian này mà OpenCode chưa mở thì bỏ qua lỗi cũ trong log
+STARTUP_ERROR_MAX_AGE_SECONDS = 600    # Lỗi cũ trong log OpenCode quá 10 phút lúc khởi động thì không tự xử lý nữa
 
 # Proxy Health Monitor: khi proxy chết, OpenCode chỉ tự thử lại ("Attempt N - retrying") mà không
 # ghi gì vào log cho tới khi bỏ cuộc - có thể mất vài phút. Nên watchdog tự thăm dò proxy định kỳ.
@@ -50,6 +54,26 @@ PROXY_HEALTH_RETRY_SECONDS = 5         # Thăm dò lại nhanh sau một lần l
 PROXY_DEAD_THRESHOLD = 2               # Số lần lỗi liên tiếp để coi proxy đã chết
 PROXY_DEAD_BACKOFF_MAX_SECONDS = 600   # Xoay IP thất bại liên tục (VD: key API hỏng) thì giãn dần, tối đa 10 phút
 RECENT_ROTATION_SECONDS = 120          # ECONNRESET tới trong khoảng này sau khi vừa xoay xong là lỗi của IP cũ
+
+# Chống xoay IP liên tục khi proxy chết ngay sau mỗi lần xoay (VD: nhà cung cấp chỉ cho kết nối mới
+# ~60s sau mỗi lần gọi API). Xoay thêm cũng chết tiếp, chỉ đốt IP và cắt luôn kết nối OpenCode đang chạy.
+PROXY_FLAP_WINDOW_SECONDS = 180        # Proxy chết trong khoảng này sau khi xoay = "xoay xong lại chết ngay"
+PROXY_FLAP_THRESHOLD = 2               # Số lần liên tiếp như vậy thì tạm ngừng tự xoay theo Health Monitor
+PROXY_FLAP_HOLD_BASE_SECONDS = 300     # Thời gian tạm ngừng lần đầu, gấp đôi mỗi lần tái diễn...
+PROXY_FLAP_HOLD_MAX_SECONDS = 1800     # ...tối đa 30 phút
+
+
+def opencode_log_line_time(line):
+    """Thời điểm (epoch) của một dòng opencode.log ("timestamp=2026-11-08T18:51:56.794Z ..."), None nếu không đọc được."""
+    m = re.search(r"timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z", line or "")
+    if not m:
+        return None
+    s = m.group(1)
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s else "%Y-%m-%dT%H:%M:%S"
+        return datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def _command_args(cmdline):
@@ -75,8 +99,167 @@ def is_background_opencode_process(cmdline):
     return subcommand == "serve" and "--service" in args
 
 
+def _toolhelp_process_pids(exe_names):
+    """{pid} của các tiến trình có tên file .exe (viết thường) thuộc exe_names, đọc thẳng từ Windows qua
+    Toolhelp32 - chỉ mất vài ms, không phụ thuộc tasklist/WMI (có lúc chậm quá 10s khi máy bận)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    ERROR_NO_MORE_FILES = 18
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        pids = set()
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() in exe_names:
+                pids.add(int(entry.th32ProcessID))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        err = ctypes.get_last_error()
+        if err != ERROR_NO_MORE_FILES:
+            raise ctypes.WinError(err)
+        return pids
+    finally:
+        kernel32.CloseHandle(snap)
+
+
+def _tasklist_process_pids(exe_names):
+    """Như _toolhelp_process_pids nhưng qua tasklist (dự phòng)."""
+    res = subprocess.run(
+        ["tasklist", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, errors="ignore", timeout=15,
+        # Không bật cửa sổ console khi service chạy bằng pythonw.exe
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"tasklist lỗi (exit {res.returncode})")
+    pids = set()
+    for row in csv.reader(res.stdout.splitlines()):
+        if len(row) >= 2 and row[0].strip().lower() in exe_names and row[1].strip().isdigit():
+            pids.add(int(row[1]))
+    return pids
+
+
+def _windows_opencode_pids():
+    exe_names = {f"{n}.exe" for n in OPENCODE_PROCESS_NAMES}
+    try:
+        return _toolhelp_process_pids(exe_names)
+    except Exception:
+        return _tasklist_process_pids(exe_names)
+
+
+def _ntquery_command_lines(pids):
+    """{pid: command line} của các PID còn sống ("" nếu không đọc được), đọc qua NtQueryInformationProcess
+    (ProcessCommandLineInformation) - chỉ cần quyền PROCESS_QUERY_LIMITED_INFORMATION (Windows 8.1+).
+    WMI (Get-CimInstance) phải đọc bộ nhớ tiến trình (PROCESS_VM_READ), mà backend "opencode-cli serve
+    --service" của OpenCode Desktop chặn quyền này: WMI trả command line rỗng, watchdog không nhận ra đó là
+    backend chạy ngầm, cứ tưởng OpenCode vẫn mở và tiếp tục thăm dò proxy + xoay IP dù đã đóng OpenCode."""
+    import ctypes
+    from ctypes import wintypes
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_COMMAND_LINE_INFORMATION = 60
+    ERROR_INVALID_PARAMETER = 87            # OpenProcess: PID không còn tồn tại
+    STILL_ACTIVE = 259
+    STATUS_INVALID_INFO_CLASS = 0xC0000003  # Windows cũ hơn 8.1
+    STATUS_SIZE_ERRORS = (0xC0000004, 0x80000005, 0xC0000023)  # INFO_LENGTH_MISMATCH, BUFFER_OVERFLOW, BUFFER_TOO_SMALL
+
+    out = {}
+    for pid in pids:
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            if ctypes.get_last_error() != ERROR_INVALID_PARAMETER:
+                out[pid] = ""  # Còn sống nhưng không mở được
+            continue
+        try:
+            code = wintypes.DWORD(0)
+            if kernel32.GetExitCodeProcess(h, ctypes.byref(code)) and code.value != STILL_ACTIVE:
+                continue  # Đã thoát, chỉ còn handle do tiến trình khác giữ
+            size = 4096
+            for _ in range(3):
+                buf = ctypes.create_string_buffer(size)
+                needed = ctypes.c_ulong(0)
+                status = ntdll.NtQueryInformationProcess(
+                    h, PROCESS_COMMAND_LINE_INFORMATION, buf, size, ctypes.byref(needed)) & 0xFFFFFFFF
+                if status in STATUS_SIZE_ERRORS and needed.value > size:
+                    size = needed.value
+                    continue
+                break
+            if status == STATUS_INVALID_INFO_CLASS:
+                raise OSError("NtQueryInformationProcess không hỗ trợ ProcessCommandLineInformation")
+            cmd = ""
+            if status == 0:
+                us = UNICODE_STRING.from_buffer(buf)
+                if us.Buffer and us.Length:
+                    cmd = ctypes.wstring_at(us.Buffer, us.Length // 2)
+            out[pid] = cmd.strip()
+        finally:
+            kernel32.CloseHandle(h)
+    return out
+
+
 def _windows_command_lines(pids):
-    """{pid: command line} của các PID còn sống ("" nếu không đọc được, VD: tiến trình chạy quyền admin)."""
+    """{pid: command line} của các PID còn sống ("" nếu không đọc được). Đọc qua NtQueryInformationProcess,
+    PID nào không đọc được (hoặc Windows quá cũ) thì thử lại qua WMI."""
+    try:
+        out = _ntquery_command_lines(pids)
+    except Exception:
+        return _cim_command_lines(pids)
+    unreadable = [p for p, cmd in out.items() if not cmd]
+    if unreadable:
+        try:
+            cim = _cim_command_lines(unreadable)
+        except Exception:
+            cim = {}
+        for p in unreadable:
+            if cim.get(p):
+                out[p] = cim[p]
+    return out
+
+
+def _cim_command_lines(pids):
+    """Như _ntquery_command_lines nhưng qua WMI (dự phòng)."""
     flt = " OR ".join(f"ProcessId={int(p)}" for p in pids)
     ps_cmd = (
         "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
@@ -126,6 +309,9 @@ class OpenCodeWatchdog:
         self.log_file = os.path.join(self.opencode_dir, "log", "opencode.log")
         self.autoreset_log = os.path.join(self.opencode_dir, "log", "opencode-autoreset.log")
         self.db_file = os.path.join(self.opencode_dir, "opencode.db")
+        # Mốc lỗi gần nhất watchdog đã thấy trong opencode.log (giữ qua các lần khởi động lại), để lúc khởi
+        # động không xử lý lại (xoay IP + gửi lệnh tiếp tục) một lỗi mà lần chạy trước đã xử lý rồi.
+        self.state_file = os.path.join(self.opencode_dir, "watchdog_state.json")
 
         self.opencode_bin = self._find_opencode_binary()
         self.lock = threading.Lock()
@@ -138,74 +324,95 @@ class OpenCodeWatchdog:
         self._probe_running = False
         self._proxy_fail_count = 0
         self._dead_proxy_failures = 0
+        self._flap_count = 0                  # Số lần liên tiếp proxy chết ngay sau khi vừa xoay
         self._next_probe_at = 0
-        self.session_retries = {}             # session_id -> int
-        self.circuit_broken_sessions = set()  # Các session bị khóa auto-resume để chống lặp vô tận
+        self.session_retries = {}             # session_id -> (số lần tự tiếp tục liên tiếp, thời điểm lần gần nhất)
+        self.circuit_broken_sessions = {}     # session_id -> thời điểm bị khóa auto-resume (chống lặp vô tận)
         self.consecutive_global_limits = 0
         self.global_limit_locked_until = 0
         self._presence_checked_at = None
         self._presence_cache = True
-        self._background_pids = {}            # pid -> True nếu là tiến trình nền (command line không đổi theo PID)
+        self._presence_recheck_at = 0         # Kiểm tra lại sớm để xác nhận tiến trình OpenCode vừa xuất hiện
+        self._presence_error_logged = False
+        self._open_reason = ""                # Tiến trình làm watchdog coi là OpenCode đang mở (để ghi log)
+        # pid -> {"bg": True/False/None (chưa đọc được command line), "cmd": str, "first_seen": time}
+        self._pid_info = {}
 
     def is_opencode_running(self):
         """Kiểm tra người dùng có đang mở OpenCode (cửa sổ Desktop hoặc CLI) không.
+        - True: có tiến trình OpenCode không chạy ngầm, đã sống ít nhất OPEN_CONFIRM_SECONDS.
+        - False: không có.
+        - None: chưa chắc (vừa thấy tiến trình mới, cần xác nhận lại) hoặc không kiểm tra được.
+          Khi đó giữ nguyên trạng thái trước, KHÔNG tự coi là đang mở - trước đây chỉ một lần
+          tasklist chậm/lỗi là watchdog tưởng OpenCode mở lại và xoay IP dù không ai mở.
         Bỏ qua tiến trình chạy ngầm (xem is_background_opencode_process): đóng cửa sổ Desktop thì
-        backend "opencode-cli serve --service" vẫn còn nhưng OpenCode coi như đã tắt.
-        Nếu không kiểm tra được thì trả về True để giữ hành vi cũ (không chặn xoay IP)."""
+        backend "opencode-cli serve --service" vẫn còn nhưng OpenCode coi như đã tắt."""
         try:
             if platform.system() == "Windows":
-                res = subprocess.run(
-                    ["tasklist", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, errors="ignore", timeout=10,
-                    # Không bật cửa sổ console khi service chạy bằng pythonw.exe
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                if res.returncode != 0:
-                    return True
-                targets = {f"{n}.exe" for n in OPENCODE_PROCESS_NAMES}
-                pids = set()
-                for row in csv.reader(res.stdout.splitlines()):
-                    if len(row) >= 2 and row[0].strip().lower() in targets and row[1].strip().isdigit():
-                        pids.add(int(row[1]))
-                return self._has_foreground_opencode(pids, _windows_command_lines)
-
-            pattern = "|".join(OPENCODE_PROCESS_NAMES)
-            res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, text=True, timeout=10)
-            if res.returncode == 1:  # 1 = không có tiến trình
-                return False
-            if res.returncode != 0:
-                return True
-            pids = {int(p) for p in res.stdout.split() if p.isdigit()}
-            return self._has_foreground_opencode(pids, _posix_command_lines)
-        except Exception:
-            return True
+                pids = _windows_opencode_pids()
+                result = self._has_foreground_opencode(pids, _windows_command_lines)
+            else:
+                pattern = "|".join(OPENCODE_PROCESS_NAMES)
+                res = subprocess.run(["pgrep", "-i", "-x", pattern], capture_output=True, text=True, timeout=10)
+                if res.returncode not in (0, 1):  # 1 = không có tiến trình
+                    raise RuntimeError(f"pgrep lỗi (exit {res.returncode})")
+                pids = {int(p) for p in res.stdout.split() if p.isdigit()}
+                result = self._has_foreground_opencode(pids, _posix_command_lines)
+            self._presence_error_logged = False
+            return result
+        except Exception as e:
+            if not self._presence_error_logged:
+                self._presence_error_logged = True
+                self.log(f"⚠️ Không kiểm tra được OpenCode có đang mở không ({type(e).__name__}: {e}) - "
+                         "giữ nguyên trạng thái hiện tại.")
+            return None
 
     def _has_foreground_opencode(self, pids, fetch_command_lines):
-        """Có PID nào trong số này không phải tiến trình nền không. Chỉ đọc command line của PID mới gặp."""
-        self._background_pids = {p: bg for p, bg in self._background_pids.items() if p in pids}
-        unknown = [p for p in pids if p not in self._background_pids]
+        """True/False/None như is_opencode_running(). Chỉ đọc command line của PID chưa biết."""
+        now = time.time()
+        self._pid_info = {p: info for p, info in self._pid_info.items() if p in pids}
+        for p in pids:
+            self._pid_info.setdefault(p, {"bg": None, "cmd": "", "first_seen": now})
+
+        unknown = [p for p in pids if self._pid_info[p]["bg"] is None]
         if unknown:
             cmdlines = fetch_command_lines(unknown)
             for pid in unknown:
-                if pid in cmdlines:  # PID không có trong kết quả = đã thoát
-                    # Không đọc được command line thì coi như OpenCode đang mở (an toàn như hành vi cũ)
-                    cmd = cmdlines[pid]
-                    self._background_pids[pid] = bool(cmd) and is_background_opencode_process(cmd)
-        return any(self._background_pids.get(p) is False for p in pids)
+                if pid not in cmdlines:  # PID không có trong kết quả = đã thoát
+                    del self._pid_info[pid]
+                    continue
+                cmd = cmdlines[pid]
+                if cmd:
+                    self._pid_info[pid].update(bg=is_background_opencode_process(cmd), cmd=cmd)
+                # Không đọc được command line (VD: tiến trình đang thoát, chạy quyền admin): đọc lại lần sau
+
+        pending = False
+        for pid, info in self._pid_info.items():
+            if info["bg"] is True:
+                continue
+            if now - info["first_seen"] >= OPEN_CONFIRM_SECONDS:
+                # Đã sống đủ lâu: tiến trình thật của người dùng (đọc mãi không ra command line cũng tính là mở)
+                self._open_reason = f"PID {pid}: {info['cmd'] or '(không đọc được command line)'}"
+                return True
+            pending = True  # Mới xuất hiện: chờ xác nhận, bỏ qua lệnh chạy chớp nhoáng (VD: --version)
+        return None if pending else False
 
     def _opencode_running_cached(self, max_age):
         """Như is_opencode_running() nhưng chỉ kiểm tra lại sau mỗi max_age giây. Ghi log khi OpenCode đóng/mở."""
         now = time.time()
-        if self._presence_checked_at is None or now - self._presence_checked_at >= max_age:
+        due = self._presence_checked_at is None or now - self._presence_checked_at >= max_age
+        if due or (self._presence_recheck_at and now >= self._presence_recheck_at):
             running = self.is_opencode_running()
-            if running != self._presence_cache:
+            self._presence_checked_at = now
+            self._presence_recheck_at = now + OPEN_CONFIRM_SECONDS if running is None else 0
+            if running is not None and running != self._presence_cache:
                 if running:
-                    self.log("▶️ OpenCode đã mở lại - tiếp tục thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục.")
+                    self.log("▶️ OpenCode đã mở lại - tiếp tục thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục. "
+                             f"[{self._open_reason[:200]}]")
                 else:
                     self.log("⏸️ OpenCode đã đóng - tạm dừng thăm dò proxy, xoay IP và tự gửi lệnh tiếp tục "
                              "cho tới khi OpenCode mở lại (Local Bridge vẫn chạy).")
-            self._presence_cache = running
-            self._presence_checked_at = now
+                self._presence_cache = running
         return self._presence_cache
 
     def _find_opencode_binary(self):
@@ -276,6 +483,30 @@ class OpenCodeWatchdog:
             timeout=timeout
         )
 
+    def _load_last_seen_error_at(self):
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                value = json.load(f).get("last_seen_error_at")
+            return float(value) if isinstance(value, (int, float)) else None
+        except Exception:
+            return None
+
+    def _remember_error_line(self, line):
+        """Ghi lại mốc thời gian của dòng lỗi vừa thấy trong opencode.log (chỉ tiến lên, không lùi)."""
+        err_at = opencode_log_line_time(line)
+        if err_at is None:
+            return
+        last = self._load_last_seen_error_at()
+        if last is not None and err_at <= last:
+            return
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"last_seen_error_at": err_at}, f)
+            os.replace(tmp, self.state_file)
+        except Exception:
+            pass
+
     def log(self, msg):
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{now}] {msg}"
@@ -302,7 +533,8 @@ class OpenCodeWatchdog:
     def get_latest_session_id(self, max_idle_seconds=900):
         """Lấy session ID gần nhất từ database SQLite của OpenCode (mở chế độ read-only an toàn).
         Chỉ trả về session nếu vừa được cập nhật trong max_idle_seconds (mặc định 15 phút)
-        và chưa hoàn tất thành công (không resume session đã xong)."""
+        và chưa hoàn tất thành công (không resume session đã xong).
+        idle_outcome: NULL khi đang chạy, 'succeeded' / 'failed' khi dừng (OpenCode 2.x; bản cũ ghi 'completed')."""
         if not os.path.exists(self.db_file):
             return None
         conn = None
@@ -322,7 +554,7 @@ class OpenCodeWatchdog:
                 cursor.execute("""
                     SELECT id FROM session_v2 
                     WHERE time_archived IS NULL 
-                      AND (idle_outcome IS NULL OR idle_outcome != 'completed')
+                      AND (idle_outcome IS NULL OR idle_outcome NOT IN ('succeeded', 'completed'))
                       AND time_updated >= ?
                     ORDER BY time_updated DESC 
                     LIMIT 1;
@@ -461,7 +693,10 @@ class OpenCodeWatchdog:
         )
 
     def _probe_proxy_health(self):
-        """Chạy trong thread riêng: thăm dò proxy, chết PROXY_DEAD_THRESHOLD lần liên tiếp thì xoay IP."""
+        """Chạy trong thread riêng: thăm dò proxy, chết PROXY_DEAD_THRESHOLD lần liên tiếp thì xoay IP.
+        Nếu proxy cứ chết ngay sau mỗi lần xoay (PROXY_FLAP_*) thì tạm ngừng tự xoay, giãn dần thời gian
+        thăm dò: lỗi kiểu này nằm ở nhà cung cấp, xoay thêm chỉ đốt IP. Lỗi OpenCode ghi trong log
+        (hết hạn mức, ECONNRESET...) vẫn được xử lý bình thường (xoay IP + gửi lệnh tiếp tục)."""
         try:
             ip = self.rotator.check_health(timeout=4, quick=True)
             now = time.time()
@@ -475,6 +710,12 @@ class OpenCodeWatchdog:
                     self.log(f"✅ Proxy đã phản hồi lại bình thường (IP: {ip}).")
                 self._proxy_fail_count = 0
                 self._dead_proxy_failures = 0
+                # Chỉ coi là hết "xoay xong chết ngay" khi IP sống qua được PROXY_FLAP_WINDOW_SECONDS
+                # (ngay sau khi xoay thì proxy lúc nào cũng phản hồi, chưa nói lên được gì)
+                if self._flap_count and now - self.last_rotation_ok_at >= PROXY_FLAP_WINDOW_SECONDS:
+                    self.log(f"✅ IP {ip} đã sống ổn định quá {PROXY_FLAP_WINDOW_SECONDS}s sau khi xoay - "
+                             "Health Monitor tự xoay IP trở lại như bình thường.")
+                    self._flap_count = 0
                 self._next_probe_at = now + PROXY_HEALTH_INTERVAL_SECONDS
                 return
 
@@ -487,6 +728,25 @@ class OpenCodeWatchdog:
 
             self._proxy_fail_count = 0
             self.current_ip_expire_time = 0  # IP đã chết - bỏ hẹn giờ TTL cũ
+
+            since_rotation = now - self.last_rotation_ok_at
+            if self.last_rotation_ok_at and since_rotation < PROXY_FLAP_WINDOW_SECONDS:
+                self._flap_count += 1
+                if self._flap_count >= PROXY_FLAP_THRESHOLD:
+                    hold = min(PROXY_FLAP_HOLD_MAX_SECONDS,
+                               PROXY_FLAP_HOLD_BASE_SECONDS * 2 ** (self._flap_count - PROXY_FLAP_THRESHOLD))
+                    self.log(f"🛑 [PROXY MONITOR] Proxy lại chết chỉ ~{int(since_rotation)}s sau khi xoay "
+                             f"({self._flap_count} lần liên tiếp) - nhiều khả năng lỗi phía nhà cung cấp proxy "
+                             "(không nhận kết nối mới), không phải do IP. Xoay thêm chỉ đốt IP và cắt kết nối "
+                             f"OpenCode đang chạy, nên tạm ngừng tự xoay {hold // 60} phút. Lỗi OpenCode báo trong "
+                             "log vẫn được xử lý (xoay IP + gửi lệnh tiếp tục). Nên kiểm tra key/gói proxy.")
+                    self.rotator.notify(
+                        "OpenCode Proxy Monitor",
+                        f"Proxy chết ngay sau mỗi lần xoay. Tạm ngừng tự xoay {hold // 60} phút - kiểm tra key proxy.",
+                    )
+                    self._next_probe_at = now + hold
+                    return
+
             result = self.handle_dead_proxy()
             if result is False:
                 self._dead_proxy_failures += 1
@@ -503,6 +763,19 @@ class OpenCodeWatchdog:
             self._next_probe_at = time.time() + PROXY_HEALTH_INTERVAL_SECONDS
         finally:
             self._probe_running = False
+
+    def _is_circuit_broken(self, session_id, now):
+        """True nếu phiên đang bị khóa auto-resume. Khóa hết hạn sau CIRCUIT_BREAKER_LOCK_SECONDS: phiên
+        bị khóa không tự lỗi lại được (không còn ai gửi lệnh tiếp tục), nên lỗi mới tới sau đó là do người
+        dùng đã cho phiên chạy lại - xử lý như một chuỗi lỗi mới."""
+        broken_at = self.circuit_broken_sessions.get(session_id)
+        if broken_at is None:
+            return False
+        if now - broken_at < CIRCUIT_BREAKER_LOCK_SECONDS:
+            return True
+        del self.circuit_broken_sessions[session_id]
+        self.log(f"🔓 [CIRCUIT BREAKER] Hết thời gian khóa - mở lại auto-resume cho phiên {session_id}.")
+        return False
 
     def handle_limit_and_resume(self, reason, session_hint=None, delay_seconds=0):
         with self.lock:
@@ -565,8 +838,11 @@ class OpenCodeWatchdog:
             self.log(f"   Target Session: {target_session or 'Chưa xác định'}")
 
             # Kiểm tra Circuit Breaker đối với session này
-            if target_session and target_session in self.circuit_broken_sessions:
-                self.log(f"⛔ [CIRCUIT BREAKER] Phiên {target_session} đang bị tạm khóa auto-resume do lỗi liên tiếp {MAX_CONSECUTIVE_SESSION_RETRIES} lần.")
+            if target_session and self._is_circuit_broken(target_session, now):
+                left_min = max(1, int((self.circuit_broken_sessions[target_session]
+                                       + CIRCUIT_BREAKER_LOCK_SECONDS - now) / 60))
+                self.log(f"⛔ [CIRCUIT BREAKER] Phiên {target_session} đang bị tạm khóa auto-resume do lỗi liên tiếp "
+                         f"{MAX_CONSECUTIVE_SESSION_RETRIES} lần (mở lại sau ~{left_min} phút).")
                 self.log("   Bỏ qua trigger tự động để tránh lặp vô tận và tiết kiệm proxy.")
                 self.log("========================================================")
                 return
@@ -613,18 +889,27 @@ class OpenCodeWatchdog:
 
             # 6. Tự động gửi prompt tiếp tục nếu được bật
             if self.auto_resume and target_session:
-                cur_retries = self.session_retries.get(target_session, 0) + 1
-                self.session_retries[target_session] = cur_retries
+                attempt_at = time.time()
+                prev_retries, prev_at = self.session_retries.get(target_session, (0, 0))
+                if attempt_at - prev_at > SESSION_RETRY_WINDOW_SECONDS:
+                    # Lần tự tiếp tục trước đã lâu (phiên chạy ổn ở giữa) - không phải lỗi liên tiếp
+                    prev_retries = 0
 
-                if cur_retries >= MAX_CONSECUTIVE_SESSION_RETRIES:
-                    self.circuit_broken_sessions.add(target_session)
-                    self.log(f"⛔ [CIRCUIT BREAKER KÍCH HOẠT] Phiên {target_session} đã thử auto-resume {cur_retries} lần liên tiếp.")
-                    self.log(f"   Tạm dừng auto-resume cho phiên này để chống vòng lặp vô tận. Vui lòng kiểm tra lại task.")
+                if prev_retries >= MAX_CONSECUTIVE_SESSION_RETRIES:
+                    # Đã tự tiếp tục đủ MAX lần, lần nào cũng lỗi lại ngay - dừng để chống vòng lặp vô tận
+                    self.circuit_broken_sessions[target_session] = attempt_at
+                    self.session_retries.pop(target_session, None)
+                    self.log(f"⛔ [CIRCUIT BREAKER KÍCH HOẠT] Phiên {target_session} vẫn lỗi sau {prev_retries} lần "
+                             "tự gửi lệnh tiếp tục liên tiếp.")
+                    self.log(f"   Tạm dừng auto-resume cho phiên này {CIRCUIT_BREAKER_LOCK_SECONDS // 60} phút để chống "
+                             "vòng lặp vô tận. Vui lòng kiểm tra lại task.")
                     self.rotator.notify(
                         "OpenCode Circuit Breaker",
-                        f"Tạm dừng auto-resume phiên {target_session[:8]} do lỗi 3 lần liên tiếp."
+                        f"Tạm dừng auto-resume phiên {target_session[:8]} do lỗi {prev_retries} lần liên tiếp."
                     )
                 else:
+                    cur_retries = prev_retries + 1
+                    self.session_retries[target_session] = (cur_retries, attempt_at)
                     self.log(f"🚀 Hết thời gian chờ! Tự động gửi lệnh tiếp tục phiên {target_session} (Thử lần {cur_retries}/{MAX_CONSECUTIVE_SESSION_RETRIES})...")
                     ok, _ = self.send_resume_prompt(target_session)
                     if ok:
@@ -672,16 +957,30 @@ class OpenCodeWatchdog:
                 curr_size = os.path.getsize(self.log_file)
                 f.seek(max(0, curr_size - 15000), os.SEEK_SET)
                 startup_lines = f.readlines()
-                for s_line in startup_lines[-10:]:
+                last_seen_error_at = self._load_last_seen_error_at()
+                for s_line in reversed(startup_lines[-10:]):  # Lỗi mới nhất trước
                     s_lower = s_line.lower()
-                    if ("free usage limit reached" in s_lower or "quotaexceeded" in s_lower or 
+                    if ("free usage limit reached" in s_lower or "quotaexceeded" in s_lower or
                         "free messages" in s_lower or "econnreset" in s_lower) and ("failed to drain" in s_lower or "limit reached" in s_lower):
+                        err_at = opencode_log_line_time(s_line)
+                        err_time = (datetime.datetime.fromtimestamp(err_at).strftime("%H:%M:%S")
+                                    if err_at is not None else "?")
+                        if err_at is not None and last_seen_error_at is not None and err_at <= last_seen_error_at:
+                            self.log(f"ℹ️ Lỗi gần nhất trong log OpenCode (lúc {err_time}) đã được lần chạy trước "
+                                     "xử lý - bỏ qua, không xoay IP / gửi lệnh tiếp tục lại.")
+                            break
+                        if err_at is not None and time.time() - err_at > STARTUP_ERROR_MAX_AGE_SECONDS:
+                            self.log(f"ℹ️ Lỗi gần nhất trong log OpenCode (lúc {err_time}) đã cũ hơn "
+                                     f"{STARTUP_ERROR_MAX_AGE_SECONDS // 60} phút - bỏ qua, không tự xử lý.")
+                            break
                         s_hint = None
                         m = re.search(r"(?:sessionID|sessionId|session\.id)=([a-zA-Z0-9_-]+)", s_line)
                         if m:
                             s_hint = m.group(1)
-                        self.log("⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất. Sẽ xử lý ngay khi OpenCode đang chạy...")
+                        self.log(f"⚠️ Phát hiện OpenCode dính lỗi hạn mức/kết nối gần nhất (lúc {err_time}) chưa được "
+                                 "xử lý. Sẽ xử lý ngay khi OpenCode đang chạy...")
                         pending_startup = (s_hint, time.time() + STARTUP_PENDING_WINDOW_SECONDS)
+                        self._remember_error_line(s_line)
                         break
             except Exception:
                 pass
@@ -810,6 +1109,8 @@ class OpenCodeWatchdog:
                         reason = "ECONNRESET / Socket Reset (trong phiên làm việc)"
 
                 if is_trigger:
+                    # Ghi mốc lỗi đã thấy (kể cả khi bỏ qua bên dưới) để lần khởi động sau không xử lý lại
+                    self._remember_error_line(line)
                     now = time.time()
                     if now - last_trigger_time < 25:
                         continue
